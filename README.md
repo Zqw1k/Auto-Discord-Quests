@@ -109,11 +109,11 @@ cargo run
 ## Releasing
 
 Push a version tag and the release workflow builds all packages and attaches them to a
-GitHub release:
+GitHub release. File names follow `version` in `Cargo.toml`, so bump it first:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 ## Getting your token
