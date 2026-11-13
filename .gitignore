@@ -3,6 +3,8 @@
 *.exe
 *.msi
 *.log
+*.AppImage
+/AppDir/
 shot-*.png
 crop*.png
 .DS_Store

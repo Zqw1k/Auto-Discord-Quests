@@ -15,6 +15,42 @@ Tauri/WebView: the backend and UI live in a single `.exe` (fonts embedded).
 | --- | --- |
 | ![Settings](docs/screenshots/settings.png) | ![Logs](docs/screenshots/logs.png) |
 
+## Install
+
+Packaged builds (`.zip`, `.deb`, `.AppImage`, `.dmg`) are attached to each
+[GitHub release](https://github.com/Zqw1k/Auto-Discord-Quests/releases).
+
+### Windows
+
+Download `questpilot-*-windows-x86_64.zip`, extract it and run `questpilot.exe`.
+The binary is unsigned, so SmartScreen may warn — choose *More info → Run anyway*.
+
+### Linux
+
+- **AppImage** (any distro): `chmod +x questpilot-*-linux-x86_64.AppImage && ./questpilot-*-linux-x86_64.AppImage`
+- **Debian / Ubuntu**: `sudo apt install ./questpilot_*_amd64.deb`
+- **Portable**: extract `questpilot-*-linux-x86_64.tar.gz` and run `./questpilot/questpilot`
+
+Runtime libraries: X11 or Wayland, `libxkbcommon` and OpenGL (`libgl1`). On a minimal
+distribution install e.g. `libx11-6 libxkbcommon0 libgl1 libwayland-client0`.
+
+The AppImage needs FUSE 2 on some distributions (`libfuse2` on Debian/Ubuntu). If it
+cannot mount, run it with `--appimage-extract-and-run`.
+
+Linux packages are built on Ubuntu 22.04 and require glibc 2.35 or newer.
+
+### macOS
+
+Download `QuestPilot-*-macos-universal.dmg`, open it and drag **QuestPilot** to
+**Applications**. The build is universal (Apple Silicon + Intel, macOS 11+).
+
+The app is not signed or notarized, so the first launch needs *right-click → Open*, or
+run once:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/QuestPilot.app
+```
+
 ## Features
 
 | Quest type | How it works | Status |
@@ -35,7 +71,7 @@ Tauri/WebView: the backend and UI live in a single `.exe` (fonts embedded).
 
 ## Build
 
-Requires stable Rust. Two options on Windows:
+Requires stable Rust. The same commands work on Linux and macOS. Two options on Windows:
 
 **Option 1 — MSVC (standard, requires Visual Studio Build Tools)**
 
@@ -70,6 +106,16 @@ $env:QUESTPILOT_DEMO_VIEW = "logs"  # quests | empty | settings | logs | help
 cargo run
 ```
 
+## Releasing
+
+Push a version tag and the release workflow builds all packages and attaches them to a
+GitHub release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Getting your token
 
 **Option 1 — Discord desktop**
@@ -96,14 +142,17 @@ src/
   app.rs               UI: login, quest list, settings, logs, toasts
   theme.rs             design tokens, Be Vietnam Pro font, vector icons, gradients
   models.rs            parses Discord quest JSON into compact models
-  config.rs            settings stored at %APPDATA%\QuestPilot\settings.json
+  config.rs            settings stored in the OS config dir (QuestPilot/settings.json)
   worker.rs            tokio worker: login, refresh, quest execution, queue, events
   discord/
     api.rs             REST client (quests, enroll, video-progress, heartbeat, claim)
     fingerprint.rs     rebuilds the 146-byte / 196-char base64 executable fingerprint
 assets/fonts/          Be Vietnam Pro (OFL)
+assets/icon.png        app icon used by packages
+packaging/             Linux .desktop entry and macOS Info.plist
 scripts/shot.ps1       captures the app window (used for README screenshots)
 docs/screenshots/      UI screenshots
+.github/workflows/     CI and release packaging (.deb, .AppImage, .dmg, .zip)
 ```
 
 ## No quests showing?
@@ -128,6 +177,7 @@ While testing the UI, you can preview the empty state with
 - **Activity**: 60-second heartbeat, progress read from `progress.PLAY_ACTIVITY.value`.
 - Every request includes `x-super-properties`, `referer: https://discord.com/quest-home` and the Discord
   client UA; 429 responses are retried once.
+- The client identity is pinned to the Windows desktop build so the same quest flow works on every OS.
 
 ## License
 

@@ -1,0 +1,192 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        shell: bash
+        run: echo "VERSION=$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/questpilot.exe dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "questpilot-$env:VERSION-windows-x86_64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: questpilot-*-windows-x86_64.zip
+
+  linux:
+    name: Linux packages
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        run: echo "VERSION=$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build Debian package
+        run: cargo deb --no-build
+
+      - name: Build portable tarball
+        run: |
+          mkdir -p dist/questpilot
+          cp target/release/questpilot dist/questpilot/
+          cp README.md LICENSE packaging/questpilot.desktop assets/icon.png dist/questpilot/
+          tar -czf "questpilot-${VERSION}-linux-x86_64.tar.gz" -C dist questpilot
+
+      - name: Build AppImage
+        run: |
+          sudo apt-get install -y --no-install-recommends squashfs-tools
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications \
+            AppDir/usr/share/icons/hicolor/512x512/apps
+          cp target/release/questpilot AppDir/usr/bin/
+          cp packaging/questpilot.desktop AppDir/questpilot.desktop
+          cp packaging/questpilot.desktop AppDir/usr/share/applications/
+          cp assets/icon.png AppDir/questpilot.png
+          cp assets/icon.png AppDir/.DirIcon
+          cp assets/icon.png AppDir/usr/share/icons/hicolor/512x512/apps/questpilot.png
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/questpilot" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir \
+            "questpilot-${VERSION}-linux-x86_64.AppImage"
+
+      - name: Collect packages
+        run: |
+          mkdir -p packages
+          cp "questpilot-${VERSION}-linux-x86_64.tar.gz" packages/
+          cp "questpilot-${VERSION}-linux-x86_64.AppImage" packages/
+          cp target/debian/*.deb packages/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: packages/*
+
+  macos:
+    name: macOS packages
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        run: echo "VERSION=$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build universal binary
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/questpilot \
+            target/aarch64-apple-darwin/release/questpilot \
+            target/x86_64-apple-darwin/release/questpilot
+
+      - name: Create QuestPilot.app
+        run: |
+          APP="dist/QuestPilot.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp dist/questpilot "$APP/Contents/MacOS/questpilot"
+          chmod +x "$APP/Contents/MacOS/questpilot"
+          sed "s/__VERSION__/${VERSION}/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+
+          mkdir -p icon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" assets/icon.png --out "icon.iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" assets/icon.png --out "icon.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
+
+          codesign --force --deep --sign - "$APP"
+
+      - name: Package DMG and ZIP
+        run: |
+          ditto -c -k --keepParent dist/QuestPilot.app "QuestPilot-${VERSION}-macos-universal.zip"
+          hdiutil create -volname "QuestPilot" -srcfolder dist/QuestPilot.app \
+            -ov -format UDZO "QuestPilot-${VERSION}-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages
+          path: |
+            QuestPilot-*-macos-universal.dmg
+            QuestPilot-*-macos-universal.zip
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - windows
+      - linux
+      - macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -lh dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

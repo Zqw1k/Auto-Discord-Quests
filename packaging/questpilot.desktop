@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=QuestPilot
+Comment=Automate Discord Quests
+Exec=questpilot
+Icon=questpilot
+Terminal=false
+Categories=Utility;Network;
+Keywords=discord;quests;
+StartupWMClass=questpilot

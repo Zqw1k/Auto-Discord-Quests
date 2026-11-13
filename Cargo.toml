@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A clean desktop app that automates Discord Quests"
 license = "MIT"
+repository = "https://github.com/Zqw1k/Auto-Discord-Quests"
 
 [dependencies]
 anyhow = "1"
@@ -16,6 +17,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[package.metadata.deb]
+maintainer = "Zqw1k <nguyenquangduong3112@gmail.com>"
+copyright = "2026, Zqw1k"
+extended-description = """QuestPilot is a compact native desktop app that completes Discord Quests
+(video, play-on-desktop and play-activity) using the same REST API as the
+Discord desktop client. The token is kept in RAM only."""
+section = "utils"
+priority = "optional"
+depends = "libc6, libgcc-s1, libgl1, libxkbcommon0, libx11-6, libwayland-client0"
+assets = [
+    ["target/release/questpilot", "usr/bin/", "755"],
+    ["packaging/questpilot.desktop", "usr/share/applications/", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/512x512/apps/questpilot.png", "644"],
+    ["README.md", "usr/share/doc/questpilot/README.md", "644"],
+    ["LICENSE", "usr/share/doc/questpilot/copyright", "644"],
+]
 
 [profile.release]
 opt-level = "s"
