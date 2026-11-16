@@ -107,6 +107,9 @@ pub struct App {
     search: String,
     logs: Vec<LogEntry>,
     running: Option<String>,
+    /// True between pressing Stop and the worker reporting the quest as
+    /// finished, so the button cannot be pressed twice.
+    stopping: bool,
     shown_progress: HashMap<String, f32>,
     logging_in: bool,
     auth_error: Option<String>,
@@ -139,6 +142,7 @@ impl App {
             search: String::new(),
             logs: Vec::new(),
             running: None,
+            stopping: false,
             shown_progress: HashMap::new(),
             logging_in: false,
             auth_error: None,
@@ -321,7 +325,10 @@ impl App {
                         self.toast(error, ToastKind::Error);
                     }
                 }
-                Event::Running(id) => self.running = id,
+                Event::Running(id) => {
+                    self.running = id;
+                    self.stopping = false;
+                }
                 Event::Progress {
                     quest_id,
                     percent,
@@ -540,6 +547,7 @@ impl App {
         self.token.clear();
         self.auth_error = None;
         self.running = None;
+        self.stopping = false;
         self.shown_progress.clear();
         self.view = View::Quests;
     }
@@ -551,6 +559,16 @@ impl App {
         }
         self.worker
             .send(Command::Start(quest, self.settings.clone()));
+    }
+
+    /// Asks the worker to stop and marks the UI as busy until the quest's
+    /// finish event arrives.
+    fn stop_quest(&mut self) {
+        if self.running.is_none() || self.stopping {
+            return;
+        }
+        self.stopping = true;
+        self.worker.send(Command::Stop);
     }
 
     fn start_all(&mut self) {
@@ -1107,6 +1125,7 @@ impl App {
     }
 
     fn footer(&mut self, context: &egui::Context) {
+        let mut stop = false;
         egui::TopBottomPanel::bottom("footer")
             .exact_height(58.0)
             .frame(
@@ -1156,7 +1175,9 @@ impl App {
                                     .color(TEXT_SOFT),
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if pill_button(
+                                if self.stopping {
+                                    tag(ui, "Stopping…", MUTED, None);
+                                } else if pill_button(
                                     ui,
                                     "Stop",
                                     Some(Icon::Stop),
@@ -1167,7 +1188,7 @@ impl App {
                                 )
                                 .clicked()
                                 {
-                                    self.worker.send(Command::Stop);
+                                    stop = true;
                                 }
                             });
                         }
@@ -1192,6 +1213,9 @@ impl App {
                     }
                 });
             });
+        if stop {
+            self.stop_quest();
+        }
     }
 
     fn settings_label(&self) -> String {
@@ -1496,7 +1520,9 @@ impl App {
                             let response = tag(ui, "Unsupported", MUTED, None);
                             response.on_hover_text(quest.kind.hint());
                         } else if running {
-                            if pill_button(
+                            if self.stopping {
+                                tag(ui, "Stopping…", MUTED, None);
+                            } else if pill_button(
                                 ui,
                                 "Stop",
                                 Some(Icon::Stop),
@@ -1575,7 +1601,7 @@ impl App {
         match action {
             Some(Action::Start(quest)) => self.start_quest(quest),
             Some(Action::Claim(id)) => self.worker.send(Command::Claim(id)),
-            Some(Action::Stop) => self.worker.send(Command::Stop),
+            Some(Action::Stop) => self.stop_quest(),
             None => {}
         }
         ui.add_space(10.0);
@@ -2017,6 +2043,16 @@ enum Action {
     Start(Quest),
     Claim(String),
     Stop,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Closing the window must not leave a quest running. The runner process
+        // also exits on its own when this process goes away, because it holds
+        // the other end of the runner's stdin pipe.
+        self.worker.send(Command::Stop);
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }
 
 impl eframe::App for App {

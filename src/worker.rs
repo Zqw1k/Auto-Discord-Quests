@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -114,33 +114,42 @@ impl Emitter {
 
 struct Active {
     cancel: Arc<AtomicBool>,
+    /// Shared with the running task so that Stop can kill the helper process
+    /// even while the task is waiting on the network.
+    runner: Arc<Mutex<Option<GameRunner>>>,
 }
 
 /// A real, idle process kept alive while a play-time quest runs. Discord's
 /// client only reports playtime for processes it sees, so the helper mode is
 /// spawned from this same binary (`questpilot --game-runner <seconds>`).
-struct GameRunner(Child);
+struct GameRunner {
+    child: Child,
+    /// Kept open for the lifetime of this handle. The helper exits as soon as
+    /// it reads EOF, which also happens if the app is killed without cleanup.
+    _pipe: Option<std::process::ChildStdin>,
+}
 
 impl GameRunner {
     fn spawn(seconds: f64) -> Option<Self> {
         let executable = std::env::current_exe().ok()?;
         let lifetime = (seconds.max(60.0) + 300.0).ceil() as u64;
-        ProcessCommand::new(executable)
+        let mut child = ProcessCommand::new(executable)
             .arg("--game-runner")
             .arg(lifetime.to_string())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .ok()
-            .map(Self)
+            .ok()?;
+        let pipe = child.stdin.take();
+        Some(Self { child, _pipe: pipe })
     }
 }
 
 impl Drop for GameRunner {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -244,7 +253,11 @@ impl Worker {
                     self.emitter
                         .log(LogLevel::Warn, "Stopping the current quest…");
                 } else {
+                    // Nothing is running. Tell the window anyway so a stale
+                    // "running" state can always be cleared with Stop.
                     self.queue.clear();
+                    self.emitter.send(Event::Running(None));
+                    self.emitter.send(Event::Stopped);
                 }
             }
             Command::Claim(quest_id) => self.claim(quest_id).await,
@@ -417,8 +430,10 @@ impl Worker {
         }
 
         let cancel = Arc::new(AtomicBool::new(false));
+        let runner = Arc::new(Mutex::new(None));
         self.active = Some(Active {
             cancel: cancel.clone(),
+            runner: runner.clone(),
         });
         self.emitter.send(Event::Running(Some(quest.id.clone())));
         self.emitter.log(
@@ -430,7 +445,7 @@ impl Worker {
         let emitter = self.emitter.clone();
         let finish_tx = self.finish_tx.clone();
         tokio::spawn(async move {
-            let finish = run_quest(api, user.id, quest, settings, emitter, cancel).await;
+            let finish = run_quest(api, user.id, quest, settings, emitter, cancel, runner).await;
             let _ = finish_tx.send(finish);
         });
     }
@@ -438,10 +453,20 @@ impl Worker {
     fn cancel_active(&mut self) {
         if let Some(active) = &self.active {
             active.cancel.store(true, Ordering::SeqCst);
+            // Kill the helper process right now instead of waiting for the
+            // async task to notice the cancellation flag.
+            if let Ok(mut slot) = active.runner.lock() {
+                slot.take();
+            }
         }
     }
 
     async fn on_finish(&mut self, finish: Finish) {
+        if let Some(active) = &self.active {
+            if let Ok(mut slot) = active.runner.lock() {
+                slot.take();
+            }
+        }
         self.active = None;
         self.emitter.send(Event::Running(None));
 
@@ -496,11 +521,12 @@ async fn run_quest(
     settings: Settings,
     emitter: Emitter,
     cancel: Arc<AtomicBool>,
+    runner: Arc<Mutex<Option<GameRunner>>>,
 ) -> Finish {
     let quest_id = quest.id.clone();
     let result = match quest.kind {
         QuestKind::Video => run_video(&api, &quest, &settings, &emitter, &cancel).await,
-        QuestKind::Game => run_game(&api, &user_id, &quest, &emitter, &cancel).await,
+        QuestKind::Game => run_game(&api, &user_id, &quest, &emitter, &cancel, &runner).await,
         QuestKind::Activity => run_activity(&api, &quest, &emitter, &cancel).await,
         QuestKind::Stream => run_stream(&api, &quest, &emitter, &cancel).await,
         _ => Err(anyhow!(
@@ -627,6 +653,7 @@ async fn run_game(
     quest: &Quest,
     emitter: &Emitter,
     cancel: &AtomicBool,
+    runner: &Mutex<Option<GameRunner>>,
 ) -> Result<()> {
     if quest.target <= 0.0 {
         bail!("Game quest has no target duration.");
@@ -656,12 +683,16 @@ async fn run_game(
         ),
     );
 
-    let runner = GameRunner::spawn(quest.target);
-    match &runner {
-        Some(_) => emitter.log(
-            LogLevel::Info,
-            "Started the game runner process for this session.",
-        ),
+    match GameRunner::spawn(quest.target) {
+        Some(runner_process) => {
+            emitter.log(
+                LogLevel::Info,
+                "Started the game runner process for this session.",
+            );
+            if let Ok(mut slot) = runner.lock() {
+                *slot = Some(runner_process);
+            }
+        }
         None => emitter.log(
             LogLevel::Warn,
             "Could not start the game runner process; heartbeats will still be sent.",
@@ -988,5 +1019,52 @@ mod tests {
         assert!(key.starts_with("stream_"));
         assert!(key[7..].chars().all(|ch| ch.is_ascii_alphanumeric()));
         assert_ne!(key, stream_key());
+    }
+
+    #[test]
+    fn stop_cancels_the_active_task_and_drops_the_runner() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let (_command_tx, command_rx) = unbounded_channel();
+        let (event_tx, _event_rx) = channel();
+        let mut worker = Worker::new(
+            command_rx,
+            event_tx,
+            egui::Context::default(),
+            Settings::default(),
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        worker.active = Some(Active {
+            cancel: cancel.clone(),
+            runner: Arc::new(Mutex::new(None)),
+        });
+
+        runtime.block_on(worker.handle(Command::Stop));
+
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(worker.active.is_some(), "the task reports back later");
+    }
+
+    #[test]
+    fn stop_always_clears_a_stale_running_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let (_command_tx, command_rx) = unbounded_channel();
+        let (event_tx, event_rx) = channel();
+        let mut worker = Worker::new(
+            command_rx,
+            event_tx,
+            egui::Context::default(),
+            Settings::default(),
+        );
+
+        runtime.block_on(worker.handle(Command::Stop));
+
+        let events: Vec<Event> = event_rx.try_iter().collect();
+        assert!(matches!(events.first(), Some(Event::Running(None))));
+        assert!(matches!(events.get(1), Some(Event::Stopped)));
     }
 }

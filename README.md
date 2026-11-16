@@ -200,7 +200,12 @@ While testing the UI, you can preview the empty state with
   fingerprint is a 146-byte structure (PE header + hardware hash + section + signature) XORed with SHA-256
   of `user_id` + salt, then base64-encoded — the same format the desktop client sends in its heartbeat.
   A second, idle copy of the app (`questpilot --game-runner <seconds>`) is started for the duration of the
-  quest and killed when it ends, so a real process exists while playtime is reported.
+  quest and killed when it ends, so a real process exists while playtime is reported. The app keeps a pipe
+  to that process open, so it also exits if the app is closed or killed, even from Task Manager.
+- **One window at a time**: a named mutex keeps a second copy from starting. Launching the app again brings
+  the existing window to the front instead, so two workers can never report progress with only one visible
+  Stop button. **Stop** cancels the worker and kills the runner immediately; the button shows *Stopping…*
+  until the worker confirms.
 - **Activity**: ~60-second heartbeat, progress read from `progress.PLAY_ACTIVITY.value`.
 - **Stream**: `POST /quests/{id}/heartbeat` with a freshly generated `stream_<32 chars>` key every ~30 s,
   the same call the desktop client makes while screen sharing. Progress is read from the heartbeat response
