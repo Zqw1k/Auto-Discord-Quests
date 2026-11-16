@@ -27,6 +27,20 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Debug-only: exercise the DevTools sign-in from a terminal. This closes
+    // and relaunches the Discord client.
+    #[cfg(debug_assertions)]
+    if std::env::args().any(|arg| arg == "--cdp-signin") {
+        match discord::cdp::sign_in(|status| println!("… {status}")) {
+            Ok(token) => {
+                let preview: String = token.chars().take(6).collect();
+                println!("token: {preview}… ({} chars)", token.len());
+            }
+            Err(error) => println!("error: {error}"),
+        }
+        return Ok(());
+    }
+
     let settings = config::load_settings();
 
     let options = eframe::NativeOptions {

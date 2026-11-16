@@ -12,6 +12,7 @@ use eframe::egui::{
 };
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,12 @@ struct LogEntry {
     text: String,
 }
 
+/// Messages from the background CDP sign-in thread.
+enum CdpEvent {
+    Status(String),
+    Done(Result<String, String>),
+}
+
 pub struct App {
     worker: Handle,
     token: String,
@@ -103,6 +110,9 @@ pub struct App {
     shown_progress: HashMap<String, f32>,
     logging_in: bool,
     auth_error: Option<String>,
+    cdp_rx: Option<Receiver<CdpEvent>>,
+    cdp_status: Option<String>,
+    confirm_cdp: bool,
     toast: Option<Toast>,
     show_help: bool,
     was_focused: bool,
@@ -132,6 +142,9 @@ impl App {
             shown_progress: HashMap::new(),
             logging_in: false,
             auth_error: None,
+            cdp_rx: None,
+            cdp_status: None,
+            confirm_cdp: false,
             toast: None,
             show_help: false,
             was_focused: false,
@@ -272,6 +285,7 @@ impl App {
     fn seed_demo(&mut self) {}
 
     fn poll_events(&mut self, context: &egui::Context) {
+        self.poll_cdp();
         while let Ok(event) = self.worker.events.try_recv() {
             match event {
                 Event::Log(level, text) => self.push_log(level, text),
@@ -388,6 +402,66 @@ impl App {
         self.logging_in = true;
         self.pending_token = token.clone();
         self.worker.send(Command::Login(token));
+    }
+
+    /// Runs the CDP sign-in on a background thread so the window keeps
+    /// repainting while Discord restarts.
+    fn start_cdp_login(&mut self) {
+        if self.cdp_rx.is_some() {
+            return;
+        }
+        self.confirm_cdp = false;
+        self.auth_error = None;
+        self.cdp_status = Some("Closing Discord…".into());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progress = |text: &str| {
+                let _ = sender.send(CdpEvent::Status(text.to_string()));
+            };
+            let result = crate::discord::cdp::sign_in(progress);
+            let _ = sender.send(CdpEvent::Done(result));
+        });
+        self.cdp_rx = Some(receiver);
+    }
+
+    fn poll_cdp(&mut self) {
+        let Some(receiver) = self.cdp_rx.take() else {
+            return;
+        };
+        let mut keep = true;
+        loop {
+            match receiver.try_recv() {
+                Ok(CdpEvent::Status(text)) => self.cdp_status = Some(text),
+                Ok(CdpEvent::Done(result)) => {
+                    keep = false;
+                    self.cdp_status = None;
+                    match result {
+                        Ok(token) => {
+                            self.token = token;
+                            self.toast("Token read from the Discord app.", ToastKind::Success);
+                            self.submit_login();
+                        }
+                        Err(error) => {
+                            self.auth_error = Some(error.clone());
+                            self.toast(error, ToastKind::Error);
+                        }
+                    }
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    keep = false;
+                    self.cdp_status = None;
+                    self.auth_error =
+                        Some("The Discord sign-in helper stopped unexpectedly.".into());
+                    break;
+                }
+            }
+        }
+        if keep {
+            self.cdp_rx = Some(receiver);
+        }
     }
 
     /// Keeps a working session around so switching accounts is one click. The
@@ -547,7 +621,7 @@ impl App {
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(54.0);
+                        ui.add_space(34.0);
                         ui.vertical_centered(|ui| {
                             ui.allocate_ui_with_layout(
                                 Vec2::new(468.0, 0.0),
@@ -571,7 +645,7 @@ impl App {
                                     .font(theme::regular(11.0))
                                     .color(MUTED),
                             );
-                            ui.add_space(30.0);
+                            ui.add_space(18.0);
                         });
                     });
             });
@@ -604,7 +678,7 @@ impl App {
         );
 
         if !self.accounts.is_empty() {
-            ui.add_space(22.0);
+            ui.add_space(16.0);
             ui.label(
                 RichText::new("Saved accounts")
                     .font(theme::medium(12.5))
@@ -688,7 +762,7 @@ impl App {
             );
         }
 
-        ui.add_space(24.0);
+        ui.add_space(16.0);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("Discord token")
@@ -811,6 +885,106 @@ impl App {
                         .color(MUTED),
                 );
             });
+        }
+
+        if crate::discord::cdp::supported() {
+            ui.add_space(12.0);
+            if self.cdp_rx.is_some() {
+                Frame::NONE
+                    .fill(tint(ACCENT, 14))
+                    .stroke(Stroke::new(1.0_f32, tint(ACCENT, 45)))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(13.0).color(ACCENT));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        self.cdp_status
+                                            .clone()
+                                            .unwrap_or_else(|| "Talking to Discord…".into()),
+                                    )
+                                    .font(theme::regular(11.5))
+                                    .color(TEXT_SOFT),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    });
+            } else if self.confirm_cdp {
+                Frame::NONE
+                    .fill(tint(WARNING, 16))
+                    .stroke(Stroke::new(1.0_f32, tint(WARNING, 55)))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            icon(ui, Icon::Alert, WARNING, 15.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "QuestPilot will close Discord, reopen it with a local debugging port and read the token of the signed-in account. Finish anything you are doing in Discord first.",
+                                    )
+                                    .font(theme::regular(11.0))
+                                    .color(Color32::from_rgb(224, 191, 137)),
+                                )
+                                .wrap(),
+                            );
+                        });
+                        ui.add_space(9.0);
+                        ui.horizontal(|ui| {
+                            if pill_button(
+                                ui,
+                                "Restart Discord and continue",
+                                Some(Icon::Refresh),
+                                ACCENT,
+                                Color32::WHITE,
+                                Stroke::NONE,
+                                0.0,
+                            )
+                            .clicked()
+                            {
+                                self.start_cdp_login();
+                            }
+                            ui.add_space(6.0);
+                            if pill_button(
+                                ui,
+                                "Cancel",
+                                None,
+                                CARD,
+                                TEXT_SOFT,
+                                Stroke::new(1.0_f32, BORDER),
+                                0.0,
+                            )
+                            .clicked()
+                            {
+                                self.confirm_cdp = false;
+                            }
+                        });
+                    });
+            } else {
+                let response = ui.add_sized(
+                    Vec2::new(ui.available_width(), 38.0),
+                    Button::new(
+                        RichText::new("Sign in with the Discord app")
+                            .font(theme::medium(12.5))
+                            .color(TEXT),
+                    )
+                    .fill(INPUT)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .corner_radius(CornerRadius::same(11)),
+                );
+                if response.clicked() {
+                    self.confirm_cdp = true;
+                }
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new("Windows only · restarts Discord to read its token")
+                        .font(theme::regular(10.5))
+                        .color(MUTED),
+                );
+            }
         }
 
         ui.add_space(10.0);
@@ -1849,6 +2023,11 @@ impl eframe::App for App {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events(context);
         self.animate_progress(context);
+
+        // The CDP helper reports from its own thread; keep the spinner alive.
+        if self.cdp_rx.is_some() {
+            context.request_repaint_after(Duration::from_millis(120));
+        }
 
         let focused = context.input(|input| input.focused);
         if focused

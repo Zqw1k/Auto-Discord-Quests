@@ -19,6 +19,9 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
+[target.'cfg(windows)'.dependencies]
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+
 [package.metadata.deb]
 maintainer = "Zqw1k <nguyenquangduong3112@gmail.com>"
 copyright = "2026, Zqw1k"

@@ -173,7 +173,7 @@ fn decrypt_value(key: &[u8; 32], payload: &[u8]) -> Option<String> {
     Some(text.trim().trim_matches('"').trim().to_string())
 }
 
-fn looks_like_token(value: &str) -> bool {
+pub(crate) fn looks_like_token(value: &str) -> bool {
     value.len() >= 50
         && value.len() <= 200
         && value.chars().all(|ch| ch.is_ascii_graphic())

@@ -67,6 +67,8 @@ xattr -dr com.apple.quarantine /Applications/QuestPilot.app
   anywhere except `discord.com`.
 - **Token detection (Windows)**: click *Detect on this device* to read the token the Discord app already
   stored, decrypted through DPAPI — only when you ask for it. Nothing is read at startup.
+- **Sign in with the Discord app (Windows)**: one click restarts Discord with a loopback DevTools port and
+  reads the token of the signed-in session, then logs in automatically. You are asked to confirm first.
 - **Saved accounts**: every successful sign-in is remembered in memory, so you can switch accounts with
   one click from the sign-in screen (sign out keeps the list; closing the app clears it).
 - **Do all**: queues open quests and runs them one by one; you can stop at any time.
@@ -131,6 +133,13 @@ On the sign-in screen click *Detect on this device*. QuestPilot reads the token 
 stored in its profile, decrypts it with your Windows DPAPI key and lists it as a saved account. It only
 runs when you click, and nothing is written back.
 
+**Option 0b — Sign in with the Discord app (Windows)**
+
+Click *Sign in with the Discord app* and confirm. QuestPilot closes Discord, reopens it with
+`--remote-debugging-port=9223` (loopback only) and reads the token from the running client through the
+DevTools protocol, then connects the account. This restarts your Discord session, so finish what you are
+doing there first. If Discord is already running with a debugging port, QuestPilot reuses it.
+
 **Option 1 — Discord desktop**
 
 1. Open Discord desktop and press `Ctrl + Shift + I`.
@@ -161,6 +170,7 @@ src/
     api.rs             REST client (quests, enroll, video-progress, heartbeat, claim)
     fingerprint.rs     rebuilds the 146-byte / 196-char base64 executable fingerprint
     token.rs           detects tokens stored by the local Discord app (Windows, DPAPI)
+    cdp.rs             DevTools sign-in: relaunches Discord and reads its live token (Windows)
 assets/fonts/          Be Vietnam Pro (OFL)
 assets/icon.png        app icon used by packages
 packaging/             Linux .desktop entry and macOS Info.plist
@@ -192,6 +202,10 @@ While testing the UI, you can preview the empty state with
   A second, idle copy of the app (`questpilot --game-runner <seconds>`) is started for the duration of the
   quest and killed when it ends, so a real process exists while playtime is reported.
 - **Activity**: ~60-second heartbeat, progress read from `progress.PLAY_ACTIVITY.value`.
+- **DevTools sign-in**: the client only opens `--remote-debugging-port` when that flag is present at launch,
+  so QuestPilot terminates the running client, relaunches it with port `9223` bound to `127.0.0.1`, then
+  sends one `Runtime.evaluate` request over the DevTools WebSocket. The script walks the webpack store for
+  `getToken()`; the port stays open while Discord runs, so close Discord when you are done if you prefer.
 - Heartbeat and video-progress delays carry random jitter so the request cadence is not perfectly regular.
 - Every request includes `x-super-properties`, `referer: https://discord.com/quest-home` and the Discord
   client UA; 429 responses are retried once.
