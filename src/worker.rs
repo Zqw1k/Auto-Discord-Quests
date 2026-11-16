@@ -502,6 +502,7 @@ async fn run_quest(
         QuestKind::Video => run_video(&api, &quest, &settings, &emitter, &cancel).await,
         QuestKind::Game => run_game(&api, &user_id, &quest, &emitter, &cancel).await,
         QuestKind::Activity => run_activity(&api, &quest, &emitter, &cancel).await,
+        QuestKind::Stream => run_stream(&api, &quest, &emitter, &cancel).await,
         _ => Err(anyhow!(
             "Quest type {} is not supported.",
             quest.kind.label()
@@ -788,6 +789,103 @@ async fn run_activity(
     verify_completion(api, quest, emitter, cancel, completed).await
 }
 
+/// Discord's desktop client prefixes every stream key with `stream_` and sends
+/// it with each heartbeat. The server treats the rest as opaque, so a fresh
+/// random key per session is enough.
+fn stream_key() -> String {
+    use rand::distributions::Alphanumeric;
+    let body: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    format!("stream_{body}")
+}
+
+/// The client sends stream heartbeats every 30 seconds.
+fn stream_wait() -> u64 {
+    30 + rand::thread_rng().gen_range(0..4)
+}
+
+async fn run_stream(
+    api: &DiscordApi,
+    quest: &Quest,
+    emitter: &Emitter,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    if quest.target <= 0.0 {
+        bail!("Stream quest has no target duration.");
+    }
+
+    if !quest.enrolled {
+        emitter.log(LogLevel::Info, "Accepting quest…");
+        api.enroll(&quest.id).await?;
+    }
+
+    let key = stream_key();
+    emitter.log(
+        LogLevel::Info,
+        "Reporting an active desktop stream to Discord.",
+    );
+
+    let target = quest.target;
+    let started = Instant::now();
+    let mut progress = quest.progress;
+    let mut checked_credit = false;
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            bail!("cancelled");
+        }
+
+        let outcome = api.send_stream_heartbeat(&quest.id, &key).await?;
+        // Until Discord reports stream seconds we fall back to elapsed time,
+        // mirroring the desktop client's own pacing.
+        let estimated = (quest.progress + started.elapsed().as_secs_f64()).min(target);
+        progress = outcome
+            .progress
+            .unwrap_or(estimated)
+            .max(progress)
+            .min(target);
+
+        emitter.send(Event::Progress {
+            quest_id: quest.id.clone(),
+            percent: (progress / target * 100.0).clamp(0.0, 99.0),
+            seconds: progress,
+            target,
+        });
+
+        if outcome.completed {
+            return verify_completion(api, quest, emitter, cancel, true).await;
+        }
+
+        // After a few heartbeats, confirm the server is actually crediting
+        // them instead of running for the full duration for nothing.
+        if !checked_credit && started.elapsed() >= Duration::from_secs(95) {
+            checked_credit = true;
+            if let Ok(quests) = api.get_quests().await {
+                if let Some(fresh) = quests.iter().find(|item| item.id == quest.id) {
+                    if fresh.progress <= quest.progress + 1.0 && !fresh.completed && !fresh.claimed
+                    {
+                        bail!(
+                            "Discord is not crediting these stream heartbeats. Stream quests may need a real stream from the desktop client."
+                        );
+                    }
+                }
+            }
+        }
+
+        if progress >= target {
+            break;
+        }
+        if !sleep_cancellable(cancel, stream_wait()).await {
+            bail!("cancelled");
+        }
+    }
+
+    verify_completion(api, quest, emitter, cancel, false).await
+}
+
 async fn verify_completion(
     api: &DiscordApi,
     quest: &Quest,
@@ -876,5 +974,19 @@ fn friendly_error(error: &anyhow::Error) -> String {
         "Could not connect to Discord. Check your network or VPN.".into()
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_keys_look_like_the_clients() {
+        let key = stream_key();
+        assert_eq!(key.len(), 39);
+        assert!(key.starts_with("stream_"));
+        assert!(key[7..].chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert_ne!(key, stream_key());
     }
 }

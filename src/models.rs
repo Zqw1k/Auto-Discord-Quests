@@ -79,9 +79,12 @@ impl QuestKind {
         }
     }
 
-    /// The task families this app can drive over the REST API.
+    /// The task families this app can drive on its own.
     pub fn supported(self) -> bool {
-        matches!(self, Self::Video | Self::Game | Self::Activity)
+        matches!(
+            self,
+            Self::Video | Self::Game | Self::Activity | Self::Stream
+        )
     }
 
     pub fn hint(self) -> &'static str {
@@ -89,7 +92,7 @@ impl QuestKind {
             Self::Video => "Auto-advance video progress",
             Self::Game => "Simulate game playtime",
             Self::Activity => "Cloud activity heartbeat",
-            Self::Stream => "Requires a real stream in a voice channel",
+            Self::Stream => "Report a desktop stream to Discord",
             Self::Achievement => "Unlock it inside the game/activity",
             Self::Unsupported => "Not supported yet",
         }

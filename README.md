@@ -60,7 +60,7 @@ xattr -dr com.apple.quarantine /Applications/QuestPilot.app
 | `WATCH_VIDEO` | `POST /quests/{id}/video-progress` at timestamp steps with slight jitter | ✅ |
 | `PLAY_ON_DESKTOP` | Fetches app metadata → builds a valid `executable_path` + `executable_fingerprint` → spawns a real idle runner process → heartbeat every ~60s | ✅ |
 | `PLAY_ACTIVITY` | Activity heartbeat, reads progress from Discord's response | ✅ |
-| `STREAM_ON_DESKTOP` | Discord requires a real stream with viewers in the voice channel | ❌ |
+| `STREAM_ON_DESKTOP` | Sends the desktop client's stream heartbeat (`stream_key`, every ~30 s) and waits for Discord to confirm | ✅ |
 | `ACHIEVEMENT_IN_*` | Must be unlocked inside the actual game/activity | ❌ |
 
 - Sign in by pasting your token; the token **stays in RAM**, is never written to disk and is never sent
@@ -202,6 +202,10 @@ While testing the UI, you can preview the empty state with
   A second, idle copy of the app (`questpilot --game-runner <seconds>`) is started for the duration of the
   quest and killed when it ends, so a real process exists while playtime is reported.
 - **Activity**: ~60-second heartbeat, progress read from `progress.PLAY_ACTIVITY.value`.
+- **Stream**: `POST /quests/{id}/heartbeat` with a freshly generated `stream_<32 chars>` key every ~30 s,
+  the same call the desktop client makes while screen sharing. Progress is read from the heartbeat response
+  (falling back to elapsed time); after ~95 seconds the quest list is checked once, so a heartbeat the server
+  silently ignores fails fast with an explanation instead of running for the full duration.
 - **DevTools sign-in**: the client only opens `--remote-debugging-port` when that flag is present at launch,
   so QuestPilot terminates the running client, relaunches it with port `9223` bound to `127.0.0.1`, then
   sends one `Runtime.evaluate` request over the DevTools WebSocket. The script walks the webpack store for

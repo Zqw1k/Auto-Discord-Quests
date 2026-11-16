@@ -287,6 +287,20 @@ impl DiscordApi {
         Ok(parse_heartbeat(&value))
     }
 
+    pub async fn send_stream_heartbeat(
+        &self,
+        quest_id: &str,
+        stream_key: &str,
+    ) -> Result<HeartbeatOutcome> {
+        let path = format!("/quests/{quest_id}/heartbeat");
+        let payload = json!({ "stream_key": stream_key });
+        let value = self
+            .send(Method::POST, &path, Some(payload))
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(parse_heartbeat(&value))
+    }
+
     pub async fn send_activity_heartbeat(
         &self,
         quest_id: &str,
