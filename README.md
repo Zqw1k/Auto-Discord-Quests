@@ -17,13 +17,15 @@ Tauri/WebView: the backend and UI live in a single `.exe` (fonts embedded).
 
 ## Install
 
-Packaged builds (`.zip`, `.deb`, `.AppImage`, `.dmg`) are attached to each
+Packaged builds (`.zip`, `.msi`, `.deb`, `.AppImage`, `.dmg`) are attached to each
 [GitHub release](https://github.com/Zqw1k/Auto-Discord-Quests/releases).
 
 ### Windows
 
 Download `questpilot-*-windows-x86_64.zip`, extract it and run `questpilot.exe`.
-The binary is unsigned, so SmartScreen may warn — choose *More info → Run anyway*.
+There is also an optional `questpilot-*-windows-x86_64.msi` installer that installs the app
+for all users and adds a Start Menu shortcut.
+The binaries are unsigned, so SmartScreen may warn — choose *More info → Run anyway*.
 
 ### Linux
 
@@ -63,9 +65,12 @@ xattr -dr com.apple.quarantine /Applications/QuestPilot.app
 
 - Sign in by pasting your token; the token **stays in RAM**, is never written to disk and is never sent
   anywhere except `discord.com`.
+- **Saved accounts**: every successful sign-in is remembered in memory, so you can switch accounts with
+  one click from the sign-in screen (sign out keeps the list; closing the app clears it).
 - **Do all**: queues open quests and runs them one by one; you can stop at any time.
 - Auto-claim rewards on completion (optional), refresh the list when you return to the window.
-- Filters (All / Open / Done), search, step-by-step logs, toast notifications.
+- Filters by state (All / Open / Done) and by reward type (Nitro / Orbs / Decoration / Other), plus search,
+  step-by-step logs and toast notifications.
 - Expired quests are hidden automatically.
 - Dark UI, Be Vietnam Pro font, hand-drawn vector icons, no external image dependencies.
 
@@ -150,6 +155,7 @@ src/
 assets/fonts/          Be Vietnam Pro (OFL)
 assets/icon.png        app icon used by packages
 packaging/             Linux .desktop entry and macOS Info.plist
+wix/                   Windows MSI definition (cargo-wix)
 scripts/shot.ps1       captures the app window (used for README screenshots)
 docs/screenshots/      UI screenshots
 .github/workflows/     CI and release packaging (.deb, .AppImage, .dmg, .zip)

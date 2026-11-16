@@ -42,6 +42,28 @@ jobs:
           name: windows-package
           path: questpilot-*-windows-x86_64.zip
 
+      # The MSI is optional: if cargo-wix or the WiX toolset is unavailable the
+      # ZIP above is still published.
+      - name: Install cargo-wix
+        continue-on-error: true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-wix
+
+      - name: Build MSI
+        continue-on-error: true
+        shell: pwsh
+        run: >-
+          cargo wix --no-build --nocapture
+          --output "questpilot-$env:VERSION-windows-x86_64.msi"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-msi
+          path: questpilot-*-windows-x86_64.msi
+          if-no-files-found: ignore
+
   linux:
     name: Linux packages
     runs-on: ubuntu-22.04

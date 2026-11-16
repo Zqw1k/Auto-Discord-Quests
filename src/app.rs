@@ -28,6 +28,42 @@ enum Filter {
     Done,
 }
 
+/// Reward buckets mirror what Discord puts in `rewards_config` (`Nitro`,
+/// `Orbs`, `Avatar Decoration`, …). Anything unknown lands in `Other`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RewardFilter {
+    Any,
+    Nitro,
+    Orbs,
+    Decoration,
+    Other,
+}
+
+impl RewardFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any reward",
+            Self::Nitro => "Nitro",
+            Self::Orbs => "Orbs",
+            Self::Decoration => "Decoration",
+            Self::Other => "Other",
+        }
+    }
+
+    fn matches(self, reward: &str) -> bool {
+        self == Self::Any || reward_kind(reward) == self
+    }
+}
+
+/// Session kept in RAM so you can hop between accounts without retyping the
+/// token. Nothing is written to disk.
+struct SavedAccount {
+    token: String,
+    label: String,
+    id: String,
+    initial: String,
+}
+
 #[derive(Clone, Copy)]
 enum ToastKind {
     Success,
@@ -50,6 +86,8 @@ struct LogEntry {
 pub struct App {
     worker: Handle,
     token: String,
+    pending_token: String,
+    accounts: Vec<SavedAccount>,
     show_token: bool,
     user: Option<User>,
     quests: Vec<Quest>,
@@ -58,6 +96,7 @@ pub struct App {
     settings: Settings,
     view: View,
     filter: Filter,
+    reward_filter: RewardFilter,
     search: String,
     logs: Vec<LogEntry>,
     running: Option<String>,
@@ -76,6 +115,8 @@ impl App {
         let mut app = Self {
             worker,
             token: String::new(),
+            pending_token: String::new(),
+            accounts: Vec::new(),
             show_token: false,
             user: None,
             quests: Vec::new(),
@@ -84,6 +125,7 @@ impl App {
             settings,
             view: View::Quests,
             filter: Filter::All,
+            reward_filter: RewardFilter::Any,
             search: String::new(),
             logs: Vec::new(),
             running: None,
@@ -192,6 +234,23 @@ impl App {
         if std::env::var("QUESTPILOT_DEMO_VIEW").as_deref() == Ok("help") {
             self.show_help = true;
         }
+        if std::env::var("QUESTPILOT_DEMO_VIEW").as_deref() == Ok("login") {
+            self.user = None;
+            self.accounts = vec![
+                SavedAccount {
+                    token: "demo-token-one".into(),
+                    label: "@questpilot".into(),
+                    id: "1".into(),
+                    initial: "Q".into(),
+                },
+                SavedAccount {
+                    token: "demo-token-two".into(),
+                    label: "@night_owl".into(),
+                    id: "2".into(),
+                    initial: "N".into(),
+                },
+            ];
+        }
         self.logs.push(LogEntry {
             time: "16:20:01".into(),
             level: LogLevel::Info,
@@ -220,6 +279,9 @@ impl App {
                     self.logging_in = false;
                     match result {
                         Ok(user) => {
+                            let token = std::mem::take(&mut self.pending_token);
+                            self.remember_account(&token, &user);
+                            self.token.clear();
                             self.user = Some(user);
                             self.auth_error = None;
                             self.view = View::Quests;
@@ -324,7 +386,31 @@ impl App {
         }
         self.auth_error = None;
         self.logging_in = true;
+        self.pending_token = token.clone();
         self.worker.send(Command::Login(token));
+    }
+
+    /// Keeps a working session around so switching accounts is one click. The
+    /// list only lives in memory; nothing is persisted.
+    fn remember_account(&mut self, token: &str, user: &User) {
+        if token.is_empty() || self.accounts.iter().any(|account| account.token == token) {
+            return;
+        }
+        self.accounts.push(SavedAccount {
+            token: token.to_string(),
+            label: user.handle(),
+            id: user.id.clone(),
+            initial: user.initial(),
+        });
+    }
+
+    fn switch_account(&mut self, index: usize) {
+        let Some(account) = self.accounts.get(index) else {
+            return;
+        };
+        self.token = account.token.clone();
+        self.auth_error = None;
+        self.submit_login();
     }
 
     fn logout(&mut self) {
@@ -472,6 +558,91 @@ impl App {
                 .font(theme::regular(13.0))
                 .color(TEXT_SOFT),
         );
+
+        if !self.accounts.is_empty() {
+            ui.add_space(22.0);
+            ui.label(
+                RichText::new("Saved accounts")
+                    .font(theme::medium(12.5))
+                    .color(TEXT_SOFT),
+            );
+            ui.add_space(7.0);
+
+            let accounts: Vec<(String, String, String)> = self
+                .accounts
+                .iter()
+                .map(|account| {
+                    (
+                        account.label.clone(),
+                        account.id.clone(),
+                        account.initial.clone(),
+                    )
+                })
+                .collect();
+            let mut connect = None;
+            let mut remove = None;
+
+            for (index, (label, id, initial)) in accounts.iter().enumerate() {
+                Frame::NONE
+                    .fill(INPUT)
+                    .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                    .corner_radius(CornerRadius::same(11))
+                    .inner_margin(Margin::symmetric(10, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                            ui.painter()
+                                .circle_filled(rect.center(), 13.0, color_from_str(id));
+                            ui.painter().text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                initial,
+                                theme::semibold(11.0),
+                                Color32::WHITE,
+                            );
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(label).font(theme::semibold(12.0)).color(TEXT));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if icon_button(ui, Icon::Close, 24.0, "Remove from this list")
+                                    .clicked()
+                                {
+                                    remove = Some(index);
+                                }
+                                ui.add_space(4.0);
+                                if pill_button(
+                                    ui,
+                                    "Connect",
+                                    Some(Icon::Play),
+                                    ACCENT,
+                                    Color32::WHITE,
+                                    Stroke::NONE,
+                                    0.0,
+                                )
+                                .clicked()
+                                {
+                                    connect = Some(index);
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+
+            if let Some(index) = connect {
+                self.switch_account(index);
+            }
+            if let Some(index) = remove {
+                self.accounts.remove(index);
+            }
+
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Or sign in with another token")
+                    .font(theme::regular(11.0))
+                    .color(MUTED),
+            );
+        }
 
         ui.add_space(24.0);
         ui.horizontal(|ui| {
@@ -902,6 +1073,26 @@ impl App {
             });
         });
 
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            for value in [
+                RewardFilter::Any,
+                RewardFilter::Nitro,
+                RewardFilter::Orbs,
+                RewardFilter::Decoration,
+                RewardFilter::Other,
+            ] {
+                let count = self
+                    .quests
+                    .iter()
+                    .filter(|quest| value.matches(&quest.reward))
+                    .count();
+                if filter_pill(ui, value.label(), self.reward_filter == value, count).clicked() {
+                    self.reward_filter = value;
+                }
+            }
+        });
+
         ui.add_space(14.0);
 
         let query = self.search.trim().to_lowercase();
@@ -914,6 +1105,7 @@ impl App {
                 Filter::Open => !quest.completed && !quest.claimed,
                 Filter::Done => quest.completed || quest.claimed,
             })
+            .filter(|(_, quest)| self.reward_filter.matches(&quest.reward))
             .filter(|(_, quest)| {
                 query.is_empty()
                     || quest.name.to_lowercase().contains(&query)
@@ -1936,6 +2128,19 @@ fn mechanism_row(ui: &mut Ui, color: Color32, title: &str, description: &str) {
             );
         });
     });
+}
+
+fn reward_kind(reward: &str) -> RewardFilter {
+    let lower = reward.to_ascii_lowercase();
+    if lower.contains("nitro") {
+        RewardFilter::Nitro
+    } else if lower.contains("orb") {
+        RewardFilter::Orbs
+    } else if lower.contains("decor") {
+        RewardFilter::Decoration
+    } else {
+        RewardFilter::Other
+    }
 }
 
 fn kind_color(kind: crate::models::QuestKind) -> Color32 {
