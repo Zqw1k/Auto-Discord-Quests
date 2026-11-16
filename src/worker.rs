@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Result};
 use eframe::egui;
 use rand::Rng;
 use std::collections::VecDeque;
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -113,6 +114,40 @@ impl Emitter {
 
 struct Active {
     cancel: Arc<AtomicBool>,
+}
+
+/// A real, idle process kept alive while a play-time quest runs. Discord's
+/// client only reports playtime for processes it sees, so the helper mode is
+/// spawned from this same binary (`questpilot --game-runner <seconds>`).
+struct GameRunner(Child);
+
+impl GameRunner {
+    fn spawn(seconds: f64) -> Option<Self> {
+        let executable = std::env::current_exe().ok()?;
+        let lifetime = (seconds.max(60.0) + 300.0).ceil() as u64;
+        ProcessCommand::new(executable)
+            .arg("--game-runner")
+            .arg(lifetime.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+            .map(Self)
+    }
+}
+
+impl Drop for GameRunner {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Heartbeats are sent a little early or late so the cadence does not look
+/// machine-generated.
+fn heartbeat_wait() -> u64 {
+    52 + rand::thread_rng().gen_range(0..17)
 }
 
 enum Finish {
@@ -572,7 +607,8 @@ async fn run_video(
         if completed || seconds >= target {
             break;
         }
-        if !sleep_cancellable(cancel, interval).await {
+        let wait = interval + rand::thread_rng().gen_range(0..2);
+        if !sleep_cancellable(cancel, wait).await {
             bail!("cancelled");
         }
     }
@@ -619,6 +655,18 @@ async fn run_game(
         ),
     );
 
+    let runner = GameRunner::spawn(quest.target);
+    match &runner {
+        Some(_) => emitter.log(
+            LogLevel::Info,
+            "Started the game runner process for this session.",
+        ),
+        None => emitter.log(
+            LogLevel::Warn,
+            "Could not start the game runner process; heartbeats will still be sent.",
+        ),
+    }
+
     let target = quest.target;
     let started = Instant::now();
     let mut progress = quest.progress;
@@ -658,7 +706,7 @@ async fn run_game(
         if progress >= target {
             break;
         }
-        if !sleep_cancellable(cancel, 60).await {
+        if !sleep_cancellable(cancel, heartbeat_wait()).await {
             bail!("cancelled");
         }
     }
@@ -725,7 +773,7 @@ async fn run_activity(
         if progress >= target {
             break;
         }
-        if !sleep_cancellable(cancel, 60).await {
+        if !sleep_cancellable(cancel, heartbeat_wait()).await {
             bail!("cancelled");
         }
     }

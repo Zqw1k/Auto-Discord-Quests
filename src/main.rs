@@ -10,6 +10,14 @@ mod worker;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    if let Some(seconds) = game_runner_seconds() {
+        // Hidden helper mode: keep a real process alive while a play-time quest
+        // is ticking, the same trick discord-quest-helper uses with its runner
+        // sidecar. The parent kills this process when the quest ends.
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        return Ok(());
+    }
+
     let settings = config::load_settings();
 
     let options = eframe::NativeOptions {
@@ -26,4 +34,17 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, settings)))),
     )
+}
+
+/// `questpilot --game-runner <seconds>` runs the dummy play-time process. It has
+/// no UI and exits on its own if the parent disappears.
+fn game_runner_seconds() -> Option<u64> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("--game-runner") {
+        return None;
+    }
+    args.next()?
+        .parse::<u64>()
+        .ok()
+        .map(|value| value.clamp(1, 86_400))
 }

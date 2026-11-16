@@ -56,7 +56,7 @@ xattr -dr com.apple.quarantine /Applications/QuestPilot.app
 | Quest type | How it works | Status |
 | --- | --- | --- |
 | `WATCH_VIDEO` | `POST /quests/{id}/video-progress` at timestamp steps with slight jitter | ✅ |
-| `PLAY_ON_DESKTOP` | Fetches app metadata → builds a valid `executable_path` + `executable_fingerprint` → heartbeat every 60s | ✅ |
+| `PLAY_ON_DESKTOP` | Fetches app metadata → builds a valid `executable_path` + `executable_fingerprint` → spawns a real idle runner process → heartbeat every ~60s | ✅ |
 | `PLAY_ACTIVITY` | Activity heartbeat, reads progress from Discord's response | ✅ |
 | `STREAM_ON_DESKTOP` | Discord requires a real stream with viewers in the voice channel | ❌ |
 | `ACHIEVEMENT_IN_*` | Must be unlocked inside the actual game/activity | ❌ |
@@ -174,7 +174,10 @@ While testing the UI, you can preview the empty state with
 - **Game**: `executable_path` is trimmed to its last two segments (matching Discord's normalization); the
   fingerprint is a 146-byte structure (PE header + hardware hash + section + signature) XORed with SHA-256
   of `user_id` + salt, then base64-encoded — the same format the desktop client sends in its heartbeat.
-- **Activity**: 60-second heartbeat, progress read from `progress.PLAY_ACTIVITY.value`.
+  A second, idle copy of the app (`questpilot --game-runner <seconds>`) is started for the duration of the
+  quest and killed when it ends, so a real process exists while playtime is reported.
+- **Activity**: ~60-second heartbeat, progress read from `progress.PLAY_ACTIVITY.value`.
+- Heartbeat and video-progress delays carry random jitter so the request cadence is not perfectly regular.
 - Every request includes `x-super-properties`, `referer: https://discord.com/quest-home` and the Discord
   client UA; 429 responses are retried once.
 - The client identity is pinned to the Windows desktop build so the same quest flow works on every OS.
