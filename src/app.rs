@@ -404,6 +404,50 @@ impl App {
         });
     }
 
+    /// Pulls tokens straight out of the local Discord profiles (Windows only).
+    fn detect_accounts(&mut self) {
+        let found = crate::discord::token::detect();
+        if found.is_empty() {
+            self.toast(
+                if crate::discord::token::supported() {
+                    "No Discord token found on this device."
+                } else {
+                    "Token detection is Windows-only for now."
+                },
+                ToastKind::Info,
+            );
+            return;
+        }
+
+        let mut added = 0;
+        for detected in found {
+            if self
+                .accounts
+                .iter()
+                .any(|account| account.token == detected.token)
+            {
+                continue;
+            }
+            self.accounts.push(SavedAccount {
+                token: detected.token.clone(),
+                initial: detected
+                    .label
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string(),
+                id: detected.token.chars().take(12).collect(),
+                label: detected.label,
+            });
+            added += 1;
+        }
+        self.toast(
+            format!("Found {added} account(s) on this device."),
+            ToastKind::Success,
+        );
+    }
+
     fn switch_account(&mut self, index: usize) {
         let Some(account) = self.accounts.get(index) else {
             return;
@@ -664,6 +708,22 @@ impl App {
                     .clicked()
                 {
                     self.show_help = true;
+                }
+                if crate::discord::token::supported() {
+                    ui.add_space(10.0);
+                    if ui
+                        .add(
+                            Button::new(
+                                RichText::new("Detect on this device")
+                                    .font(theme::medium(11.5))
+                                    .color(TEXT_SOFT),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.detect_accounts();
+                    }
                 }
             });
         });

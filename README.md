@@ -65,6 +65,8 @@ xattr -dr com.apple.quarantine /Applications/QuestPilot.app
 
 - Sign in by pasting your token; the token **stays in RAM**, is never written to disk and is never sent
   anywhere except `discord.com`.
+- **Token detection (Windows)**: click *Detect on this device* to read the token the Discord app already
+  stored, decrypted through DPAPI — only when you ask for it. Nothing is read at startup.
 - **Saved accounts**: every successful sign-in is remembered in memory, so you can switch accounts with
   one click from the sign-in screen (sign out keeps the list; closing the app clears it).
 - **Do all**: queues open quests and runs them one by one; you can stop at any time.
@@ -123,6 +125,12 @@ git push origin v1.2.0
 
 ## Getting your token
 
+**Option 0 — Detect on this device (Windows)**
+
+On the sign-in screen click *Detect on this device*. QuestPilot reads the token the Discord app already
+stored in its profile, decrypts it with your Windows DPAPI key and lists it as a saved account. It only
+runs when you click, and nothing is written back.
+
 **Option 1 — Discord desktop**
 
 1. Open Discord desktop and press `Ctrl + Shift + I`.
@@ -152,6 +160,7 @@ src/
   discord/
     api.rs             REST client (quests, enroll, video-progress, heartbeat, claim)
     fingerprint.rs     rebuilds the 146-byte / 196-char base64 executable fingerprint
+    token.rs           detects tokens stored by the local Discord app (Windows, DPAPI)
 assets/fonts/          Be Vietnam Pro (OFL)
 assets/icon.png        app icon used by packages
 packaging/             Linux .desktop entry and macOS Info.plist

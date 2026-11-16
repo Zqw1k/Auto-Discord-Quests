@@ -18,6 +18,15 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    #[cfg(debug_assertions)]
+    if std::env::args().any(|arg| arg == "--detect-tokens") {
+        for found in discord::token::detect() {
+            let preview: String = found.token.chars().take(6).collect();
+            println!("{}: {preview}… ({} chars)", found.label, found.token.len());
+        }
+        return Ok(());
+    }
+
     let settings = config::load_settings();
 
     let options = eframe::NativeOptions {

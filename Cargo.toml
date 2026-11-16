@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/Zqw1k/Auto-Discord-Quests"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
