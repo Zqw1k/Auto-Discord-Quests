@@ -202,6 +202,10 @@ While testing the UI, you can preview the empty state with
   A second, idle copy of the app (`questpilot --game-runner <seconds>`) is started for the duration of the
   quest and killed when it ends, so a real process exists while playtime is reported. The app keeps a pipe
   to that process open, so it also exits if the app is closed or killed, even from Task Manager.
+  Heartbeats are never more than 60 seconds apart (the window Discord credits per beat) and the loop trusts
+  `progress.PLAY_ACTIVITY.value` from the response: it keeps playing until Discord itself reports the target,
+  so quests no longer end one heartbeat (≈1%) short. Stopping, failing or finishing always sends a terminal
+  heartbeat so Discord closes the play session instead of continuing to count time.
 - **One window at a time**: a named mutex keeps a second copy from starting. Launching the app again brings
   the existing window to the front instead, so two workers can never report progress with only one visible
   Stop button. **Stop** cancels the worker and kills the runner immediately; the button shows *Stopping…*

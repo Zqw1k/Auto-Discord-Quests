@@ -132,7 +132,9 @@ struct GameRunner {
 impl GameRunner {
     fn spawn(seconds: f64) -> Option<Self> {
         let executable = std::env::current_exe().ok()?;
-        let lifetime = (seconds.max(60.0) + 300.0).ceil() as u64;
+        // Outlive the quest by a margin: the heartbeat loop may keep the
+        // session open a little longer while Discord credits the last beat.
+        let lifetime = (seconds.max(60.0) + 900.0).ceil() as u64;
         let mut child = ProcessCommand::new(executable)
             .arg("--game-runner")
             .arg(lifetime.to_string())
@@ -153,10 +155,30 @@ impl Drop for GameRunner {
     }
 }
 
-/// Heartbeats are sent a little early or late so the cadence does not look
-/// machine-generated.
+/// Discord credits playtime in heartbeat-sized windows: a beat more than 60
+/// seconds apart loses the extra seconds, which is what leaves a quest one
+/// percent short. Jitter stays inside that window.
 fn heartbeat_wait() -> u64 {
-    52 + rand::thread_rng().gen_range(0..17)
+    54 + rand::thread_rng().gen_range(0..6)
+}
+
+fn percent(progress: f64, target: f64) -> f64 {
+    if target <= 0.0 {
+        0.0
+    } else {
+        (progress / target * 100.0).clamp(0.0, 100.0)
+    }
+}
+
+/// Sends the same numbers the window shows, so the bar always reflects what
+/// Discord has credited instead of a local estimate.
+fn emit_progress(emitter: &Emitter, quest_id: &str, seconds: f64, target: f64) {
+    emitter.send(Event::Progress {
+        quest_id: quest_id.to_string(),
+        percent: percent(seconds, target),
+        seconds,
+        target,
+    });
 }
 
 enum Finish {
@@ -590,12 +612,7 @@ async fn run_video(
     let mut seconds = quest.progress.clamp(0.0, target);
     let loop_started = Instant::now();
 
-    emitter.send(Event::Progress {
-        quest_id: quest.id.clone(),
-        percent: (seconds / target * 100.0).clamp(0.0, 100.0),
-        seconds,
-        target,
-    });
+    emit_progress(emitter, &quest.id, seconds, target);
 
     let mut completed = false;
     while seconds < target {
@@ -624,12 +641,7 @@ async fn run_video(
         completed = api.update_video_progress(&quest.id, timestamp).await?;
         seconds = desired;
 
-        emitter.send(Event::Progress {
-            quest_id: quest.id.clone(),
-            percent: (seconds / target * 100.0).clamp(0.0, 100.0),
-            seconds,
-            target,
-        });
+        emit_progress(emitter, &quest.id, seconds, target);
 
         if completed || seconds >= target {
             break;
@@ -644,7 +656,17 @@ async fn run_video(
         completed = api.update_video_progress(&quest.id, target).await?;
     }
 
-    verify_completion(api, quest, emitter, cancel, completed).await
+    if completed {
+        emit_progress(emitter, &quest.id, target, target);
+        return Ok(());
+    }
+    if wait_for_completion(api, quest, emitter, cancel).await? {
+        return Ok(());
+    }
+    if cancel.load(Ordering::SeqCst) {
+        bail!("cancelled");
+    }
+    bail!("Discord has not confirmed this video quest yet. Try again in a few minutes.")
 }
 
 async fn run_game(
@@ -699,9 +721,39 @@ async fn run_game(
         ),
     }
 
+    let result = game_session(api, quest, emitter, cancel, &executable_path, &fingerprint).await;
+    // Close the Discord session even when the user pressed Stop or the run
+    // failed; otherwise the server keeps counting playtime afterwards.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(8),
+        api.send_game_heartbeat(
+            &quest.id,
+            quest.app_id(),
+            true,
+            Some(&executable_path),
+            Some(&fingerprint),
+        ),
+    )
+    .await;
+    result
+}
+
+async fn game_session(
+    api: &DiscordApi,
+    quest: &Quest,
+    emitter: &Emitter,
+    cancel: &AtomicBool,
+    executable_path: &str,
+    fingerprint: &str,
+) -> Result<()> {
     let target = quest.target;
     let started = Instant::now();
+    // Discord can sit a beat behind the clock, so the loop keeps the session
+    // alive until the server itself reports the target. The deadline only
+    // guards against a server that stops crediting altogether.
+    let deadline = started + Duration::from_secs((target - quest.progress).max(0.0) as u64 + 300);
     let mut progress = quest.progress;
+    let mut credited: Option<f64> = None;
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -713,47 +765,65 @@ async fn run_game(
                 &quest.id,
                 quest.app_id(),
                 false,
-                Some(&executable_path),
-                Some(&fingerprint),
+                Some(executable_path),
+                Some(fingerprint),
             )
             .await?;
 
+        if let Some(value) = outcome.progress {
+            credited = Some(value.max(credited.unwrap_or(0.0)));
+        }
+        // Discord's own number wins; the clock is only a fallback for
+        // responses that carry no progress at all.
         let estimated = (quest.progress + started.elapsed().as_secs_f64()).min(target);
-        progress = outcome
-            .progress
-            .unwrap_or(estimated)
-            .max(progress)
-            .min(target);
-
-        emitter.send(Event::Progress {
-            quest_id: quest.id.clone(),
-            percent: (progress / target * 100.0).clamp(0.0, 99.0),
-            seconds: progress,
-            target,
-        });
+        progress = credited.unwrap_or(estimated).clamp(progress, target);
+        emit_progress(emitter, &quest.id, progress, target);
 
         if outcome.completed {
-            return verify_completion(api, quest, emitter, cancel, true).await;
+            return Ok(());
         }
-        if progress >= target {
-            break;
+
+        let reached = match credited {
+            Some(value) => value >= target - 0.5,
+            None => estimated >= target,
+        };
+        if reached {
+            // Ask Discord to finalise, then read the answer back. If it has not
+            // credited the newest heartbeat yet, keep playing one more beat
+            // instead of ending 1% short.
+            let terminal = api
+                .send_game_heartbeat(
+                    &quest.id,
+                    quest.app_id(),
+                    true,
+                    Some(executable_path),
+                    Some(fingerprint),
+                )
+                .await;
+            if terminal.map(|outcome| outcome.completed).unwrap_or(false) {
+                return Ok(());
+            }
+            if wait_for_completion(api, quest, emitter, cancel).await? {
+                return Ok(());
+            }
+            if cancel.load(Ordering::SeqCst) {
+                bail!("cancelled");
+            }
+            emitter.log(
+                LogLevel::Warn,
+                "Discord has not credited the newest heartbeat yet; keeping the game session open.",
+            );
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "Discord credited {progress:.0} of {target:.0} seconds but never marked the quest complete. Try again later."
+            );
         }
         if !sleep_cancellable(cancel, heartbeat_wait()).await {
             bail!("cancelled");
         }
     }
-
-    let terminal = api
-        .send_game_heartbeat(
-            &quest.id,
-            quest.app_id(),
-            true,
-            Some(&executable_path),
-            Some(&fingerprint),
-        )
-        .await?;
-
-    verify_completion(api, quest, emitter, cancel, terminal.completed).await
 }
 
 async fn run_activity(
@@ -775,8 +845,10 @@ async fn run_activity(
     }
 
     let target = quest.target;
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs((target - quest.progress).max(0.0) as u64 + 300);
     let mut progress = quest.progress;
-    let mut completed = false;
+    let mut credited: Option<f64> = None;
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -787,37 +859,54 @@ async fn run_activity(
             .send_activity_heartbeat(&quest.id, quest.app_id(), false)
             .await?;
         if let Some(value) = outcome.progress {
-            progress = value.max(progress);
+            credited = Some(value.max(credited.unwrap_or(0.0)));
         }
-        progress = progress.min(target);
-
-        emitter.send(Event::Progress {
-            quest_id: quest.id.clone(),
-            percent: (progress / target * 100.0).clamp(0.0, 99.0),
-            seconds: progress,
-            target,
-        });
+        let estimated = (quest.progress + started.elapsed().as_secs_f64()).min(target);
+        progress = credited.unwrap_or(estimated).clamp(progress, target);
+        emit_progress(emitter, &quest.id, progress, target);
 
         if outcome.completed {
-            completed = true;
             break;
         }
-        if progress >= target {
-            break;
+        let reached = match credited {
+            Some(value) => value >= target - 0.5,
+            None => estimated >= target,
+        };
+        if reached {
+            let terminal = api
+                .send_activity_heartbeat(&quest.id, quest.app_id(), true)
+                .await;
+            if terminal.map(|outcome| outcome.completed).unwrap_or(false) {
+                break;
+            }
+            if wait_for_completion(api, quest, emitter, cancel).await? {
+                break;
+            }
+            if cancel.load(Ordering::SeqCst) {
+                bail!("cancelled");
+            }
+            emitter.log(
+                LogLevel::Warn,
+                "Discord has not credited the newest heartbeat yet; keeping the activity session open.",
+            );
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "Discord credited {progress:.0} of {target:.0} seconds but never marked the quest complete. Try again later."
+            );
         }
         if !sleep_cancellable(cancel, heartbeat_wait()).await {
             bail!("cancelled");
         }
     }
 
-    let terminal = api
-        .send_activity_heartbeat(&quest.id, quest.app_id(), true)
-        .await?;
-    if terminal.completed {
-        completed = true;
-    }
-
-    verify_completion(api, quest, emitter, cancel, completed).await
+    let _ = tokio::time::timeout(
+        Duration::from_secs(8),
+        api.send_activity_heartbeat(&quest.id, quest.app_id(), true),
+    )
+    .await;
+    Ok(())
 }
 
 /// Discord's desktop client prefixes every stream key with `stream_` and sends
@@ -861,7 +950,9 @@ async fn run_stream(
 
     let target = quest.target;
     let started = Instant::now();
+    let deadline = started + Duration::from_secs((target - quest.progress).max(0.0) as u64 + 300);
     let mut progress = quest.progress;
+    let mut credited: Option<f64> = None;
     let mut checked_credit = false;
 
     loop {
@@ -872,22 +963,15 @@ async fn run_stream(
         let outcome = api.send_stream_heartbeat(&quest.id, &key).await?;
         // Until Discord reports stream seconds we fall back to elapsed time,
         // mirroring the desktop client's own pacing.
+        if let Some(value) = outcome.progress {
+            credited = Some(value.max(credited.unwrap_or(0.0)));
+        }
         let estimated = (quest.progress + started.elapsed().as_secs_f64()).min(target);
-        progress = outcome
-            .progress
-            .unwrap_or(estimated)
-            .max(progress)
-            .min(target);
-
-        emitter.send(Event::Progress {
-            quest_id: quest.id.clone(),
-            percent: (progress / target * 100.0).clamp(0.0, 99.0),
-            seconds: progress,
-            target,
-        });
+        progress = credited.unwrap_or(estimated).clamp(progress, target);
+        emit_progress(emitter, &quest.id, progress, target);
 
         if outcome.completed {
-            return verify_completion(api, quest, emitter, cancel, true).await;
+            return Ok(());
         }
 
         // After a few heartbeats, confirm the server is actually crediting
@@ -906,59 +990,57 @@ async fn run_stream(
             }
         }
 
-        if progress >= target {
+        let reached = match credited {
+            Some(value) => value >= target - 0.5,
+            None => estimated >= target,
+        };
+        if reached {
             break;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Discord credited {progress:.0} of {target:.0} seconds but never marked the quest complete. Try again later."
+            );
         }
         if !sleep_cancellable(cancel, stream_wait()).await {
             bail!("cancelled");
         }
     }
 
-    verify_completion(api, quest, emitter, cancel, false).await
+    if wait_for_completion(api, quest, emitter, cancel).await? {
+        return Ok(());
+    }
+    if cancel.load(Ordering::SeqCst) {
+        bail!("cancelled");
+    }
+    bail!("Discord has not confirmed this stream quest yet. Try again in a few minutes.")
 }
 
-async fn verify_completion(
+/// Asks Discord for the quest state until it reports the quest as completed,
+/// forwarding the server's own numbers so the window matches Discord exactly.
+async fn wait_for_completion(
     api: &DiscordApi,
     quest: &Quest,
     emitter: &Emitter,
     cancel: &AtomicBool,
-    already_completed: bool,
-) -> Result<()> {
-    if already_completed {
-        emitter.send(Event::Progress {
-            quest_id: quest.id.clone(),
-            percent: 100.0,
-            seconds: quest.target,
-            target: quest.target,
-        });
-        return Ok(());
-    }
-
-    emitter.log(LogLevel::Info, "Waiting for Discord to confirm completion…");
-
-    for attempt in 0..6 {
+) -> Result<bool> {
+    for attempt in 0..8 {
         if cancel.load(Ordering::SeqCst) {
-            bail!("cancelled");
+            return Ok(false);
         }
         if attempt > 0 && !sleep_cancellable(cancel, 2).await {
-            bail!("cancelled");
+            return Ok(false);
         }
         if let Ok(quests) = api.get_quests().await {
             if let Some(fresh) = quests.iter().find(|item| item.id == quest.id) {
-                emitter.send(Event::Progress {
-                    quest_id: quest.id.clone(),
-                    percent: fresh.ratio() * 100.0,
-                    seconds: fresh.progress,
-                    target: fresh.target,
-                });
+                emit_progress(emitter, &quest.id, fresh.progress, fresh.target.max(1.0));
                 if fresh.completed {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
     }
-
-    bail!("Discord has not confirmed completion yet. Try again in a few minutes.")
+    Ok(false)
 }
 
 async fn sleep_cancellable(cancel: &AtomicBool, seconds: u64) -> bool {
@@ -1066,5 +1148,21 @@ mod tests {
         let events: Vec<Event> = event_rx.try_iter().collect();
         assert!(matches!(events.first(), Some(Event::Running(None))));
         assert!(matches!(events.get(1), Some(Event::Stopped)));
+    }
+
+    #[test]
+    fn heartbeats_stay_inside_discords_credit_window() {
+        for _ in 0..200 {
+            let wait = heartbeat_wait();
+            assert!((54..=60).contains(&wait), "interval {wait}s loses credit");
+        }
+    }
+
+    #[test]
+    fn progress_percentage_is_clamped() {
+        assert_eq!(percent(450.0, 900.0), 50.0);
+        assert_eq!(percent(1200.0, 900.0), 100.0);
+        assert_eq!(percent(-5.0, 900.0), 0.0);
+        assert_eq!(percent(10.0, 0.0), 0.0);
     }
 }
