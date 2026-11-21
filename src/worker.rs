@@ -893,7 +893,18 @@ async fn game_session(
                 "Discord credited {progress:.0} of {target:.0} seconds but never marked the quest complete. Try again later."
             );
         }
-        if !sleep_cancellable(cancel, heartbeat_wait()).await {
+        if !tick_progress(
+            cancel,
+            emitter,
+            &quest.id,
+            (quest.progress + started.elapsed().as_secs_f64())
+                .min(target)
+                .max(progress),
+            target,
+            heartbeat_wait(),
+        )
+        .await
+        {
             bail!("cancelled");
         }
     }
@@ -969,7 +980,18 @@ async fn run_activity(
                 "Discord credited {progress:.0} of {target:.0} seconds but never marked the quest complete. Try again later."
             );
         }
-        if !sleep_cancellable(cancel, heartbeat_wait()).await {
+        if !tick_progress(
+            cancel,
+            emitter,
+            &quest.id,
+            (quest.progress + started.elapsed().as_secs_f64())
+                .min(target)
+                .max(progress),
+            target,
+            heartbeat_wait(),
+        )
+        .await
+        {
             bail!("cancelled");
         }
     }
@@ -1075,7 +1097,18 @@ async fn run_stream(
                 "Discord credited {progress:.0} of {target:.0} seconds but never marked the quest complete. Try again later."
             );
         }
-        if !sleep_cancellable(cancel, stream_wait()).await {
+        if !tick_progress(
+            cancel,
+            emitter,
+            &quest.id,
+            (quest.progress + started.elapsed().as_secs_f64())
+                .min(target)
+                .max(progress),
+            target,
+            stream_wait(),
+        )
+        .await
+        {
             bail!("cancelled");
         }
     }
@@ -1125,6 +1158,37 @@ async fn sleep_cancellable(cancel: &AtomicBool, seconds: u64) -> bool {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     !cancel.load(Ordering::SeqCst)
+}
+
+/// Waits for the next heartbeat while moving the bar every second, so the
+/// window updates like the Discord client instead of jumping once a minute.
+/// `origin` is the seconds value already on screen; each tick adds one second
+/// and stops at the target.
+async fn tick_progress(
+    cancel: &AtomicBool,
+    emitter: &Emitter,
+    quest_id: &str,
+    origin: f64,
+    target: f64,
+    wait: u64,
+) -> bool {
+    for second in 1..=wait {
+        if !sleep_cancellable(cancel, 1).await {
+            return false;
+        }
+        emit_progress(
+            emitter,
+            quest_id,
+            tick_estimate(origin, second, target),
+            target,
+        );
+    }
+    !cancel.load(Ordering::SeqCst)
+}
+
+/// Clock-based value shown between two heartbeats. Never past the target.
+fn tick_estimate(origin: f64, second: u64, target: f64) -> f64 {
+    (origin + second as f64).min(target)
 }
 
 impl Quest {
@@ -1303,6 +1367,43 @@ mod tests {
         assert_eq!(percent(1200.0, 900.0), 100.0);
         assert_eq!(percent(-5.0, 900.0), 0.0);
         assert_eq!(percent(10.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn between_heartbeats_the_bar_ticks_without_going_backwards() {
+        // 600s credited, 10s into the session: the next heartbeat may credit
+        // less than the clock, so the caller floors `origin` at what is shown.
+        assert_eq!(tick_estimate(610.0, 1, 900.0), 611.0);
+        assert_eq!(tick_estimate(610.0, 30, 900.0), 640.0);
+        assert_eq!(tick_estimate(650.0, 1, 900.0), 651.0);
+        // Never past the target.
+        assert_eq!(tick_estimate(895.0, 10, 900.0), 900.0);
+    }
+
+    #[test]
+    fn progress_ticks_once_per_second_while_waiting() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let (event_tx, event_rx) = channel();
+        let emitter = Emitter {
+            events: event_tx,
+            context: egui::Context::default(),
+        };
+        let cancel = AtomicBool::new(false);
+
+        let finished = runtime.block_on(tick_progress(&cancel, &emitter, "quest", 10.0, 900.0, 2));
+        assert!(finished);
+
+        let values: Vec<f64> = event_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Progress { seconds, .. } => Some(seconds),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values, [11.0, 12.0]);
     }
 
     /// A 2x2 palette PNG with a `tRNS` chunk. Discord still serves these for

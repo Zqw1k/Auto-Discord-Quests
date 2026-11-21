@@ -78,6 +78,7 @@ xattr -dr com.apple.quarantine /Applications/QuestPilot.app
 - Filters by state (All / Open / Done) and by reward type (Nitro / Orbs / Decoration / Other), plus search,
   step-by-step logs and toast notifications.
 - Expired quests are hidden automatically.
+- Progress bars update every second and then snap to Discord's own numbers on each heartbeat.
 - Dark UI, Be Vietnam Pro font, hand-drawn vector icons, no external image dependencies.
 
 ## Build
@@ -214,8 +215,10 @@ While testing the UI, you can preview the empty state with
   to that process open, so it also exits if the app is closed or killed, even from Task Manager.
   Heartbeats are never more than 60 seconds apart (the window Discord credits per beat) and the loop trusts
   `progress.PLAY_ACTIVITY.value` from the response: it keeps playing until Discord itself reports the target,
-  so quests no longer end one heartbeat (≈1%) short. Stopping, failing or finishing always sends a terminal
-  heartbeat so Discord closes the play session instead of continuing to count time.
+  so quests no longer end one heartbeat (≈1%) short. Between heartbeats the bar still moves once per
+  second from the clock, but never slides back when Discord reports a smaller number. Stopping, failing or
+  finishing always sends a terminal heartbeat so Discord closes the play session instead of continuing to
+  count time.
 - **One window at a time**: a named mutex keeps a second copy from starting. Launching the app again brings
   the existing window to the front instead, so two workers can never report progress with only one visible
   Stop button. **Stop** cancels the worker and kills the runner immediately; the button shows *Stopping…*
