@@ -7,6 +7,7 @@ pub struct User {
     pub username: String,
     pub global_name: Option<String>,
     pub discriminator: String,
+    pub avatar: Option<String>,
 }
 
 impl User {
@@ -32,6 +33,26 @@ impl User {
                 .and_then(Value::as_str)
                 .unwrap_or("0")
                 .to_string(),
+            avatar: value
+                .get("avatar")
+                .and_then(Value::as_str)
+                .filter(|hash| !hash.is_empty())
+                .map(str::to_string),
+        }
+    }
+
+    /// CDN URL for the real profile picture, or Discord's generated default
+    /// avatar when the account never uploaded one.
+    pub fn avatar_url(&self, size: u16) -> String {
+        match &self.avatar {
+            Some(hash) => format!(
+                "https://cdn.discordapp.com/avatars/{}/{hash}.png?size={size}",
+                self.id
+            ),
+            None => {
+                let index = self.id.parse::<u64>().map(|id| (id >> 22) % 6).unwrap_or(0);
+                format!("https://cdn.discordapp.com/embed/avatars/{index}.png")
+            }
         }
     }
 

@@ -58,11 +58,10 @@ impl RewardFilter {
 
 /// Session kept in RAM so you can hop between accounts without retyping the
 /// token. Nothing is written to disk.
+#[derive(Clone)]
 struct SavedAccount {
     token: String,
-    label: String,
-    id: String,
-    initial: String,
+    user: User,
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +115,9 @@ pub struct App {
     cdp_rx: Option<Receiver<CdpEvent>>,
     cdp_status: Option<String>,
     confirm_cdp: bool,
+    confirm_logout: bool,
+    avatars: HashMap<String, egui::TextureHandle>,
+    avatar_requests: std::collections::HashSet<String>,
     toast: Option<Toast>,
     show_help: bool,
     was_focused: bool,
@@ -149,6 +151,9 @@ impl App {
             cdp_rx: None,
             cdp_status: None,
             confirm_cdp: false,
+            confirm_logout: false,
+            avatars: HashMap::new(),
+            avatar_requests: std::collections::HashSet::new(),
             toast: None,
             show_help: false,
             was_focused: false,
@@ -196,6 +201,7 @@ impl App {
             username: "questpilot".into(),
             global_name: Some("QuestPilot".into()),
             discriminator: "0".into(),
+            avatar: None,
         });
         self.quests = vec![
             sample(
@@ -251,20 +257,31 @@ impl App {
         if std::env::var("QUESTPILOT_DEMO_VIEW").as_deref() == Ok("help") {
             self.show_help = true;
         }
+        if std::env::var("QUESTPILOT_DEMO_VIEW").as_deref() == Ok("logout") {
+            self.confirm_logout = true;
+        }
         if std::env::var("QUESTPILOT_DEMO_VIEW").as_deref() == Ok("login") {
             self.user = None;
             self.accounts = vec![
                 SavedAccount {
                     token: "demo-token-one".into(),
-                    label: "@questpilot".into(),
-                    id: "1".into(),
-                    initial: "Q".into(),
+                    user: User {
+                        id: "1".into(),
+                        username: "questpilot".into(),
+                        global_name: Some("QuestPilot".into()),
+                        discriminator: "0".into(),
+                        avatar: None,
+                    },
                 },
                 SavedAccount {
                     token: "demo-token-two".into(),
-                    label: "@night_owl".into(),
-                    id: "2".into(),
-                    initial: "N".into(),
+                    user: User {
+                        id: "2".into(),
+                        username: "night_owl".into(),
+                        global_name: Some("Night Owl".into()),
+                        discriminator: "0".into(),
+                        avatar: None,
+                    },
                 },
             ];
         }
@@ -310,6 +327,37 @@ impl App {
                             self.toast(error, ToastKind::Error);
                         }
                     }
+                }
+                Event::Accounts(found) => {
+                    let mut added = 0;
+                    for account in found {
+                        if self
+                            .accounts
+                            .iter()
+                            .any(|existing| existing.token == account.token)
+                        {
+                            continue;
+                        }
+                        self.accounts.push(SavedAccount {
+                            token: account.token,
+                            user: account.user,
+                        });
+                        added += 1;
+                    }
+                    if added == 0 {
+                        self.toast("No new accounts found.", ToastKind::Info);
+                    } else {
+                        self.toast(
+                            format!("Found {added} account(s) on this device."),
+                            ToastKind::Success,
+                        );
+                    }
+                }
+                Event::Avatar { url, size, pixels } => {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                    let texture =
+                        context.load_texture(url.clone(), image, egui::TextureOptions::LINEAR);
+                    self.avatars.insert(url, texture);
                 }
                 Event::Quests { quests, note } => {
                     self.quests = quests;
@@ -374,6 +422,38 @@ impl App {
         }
         if self.logging_in {
             context.request_repaint_after(Duration::from_millis(120));
+        }
+        self.request_avatars();
+    }
+
+    /// Draws the real profile picture when it has been downloaded, otherwise a
+    /// coloured circle with the account's initial.
+    fn avatar(&self, ui: &mut Ui, user: &User, size: f32) {
+        let url = user.avatar_url(64);
+        if let Some(texture) = self.avatars.get(&url) {
+            let source = egui::load::SizedTexture::new(texture.id(), Vec2::splat(size));
+            let radius = CornerRadius::same((size / 2.0).round() as u8);
+            ui.add(egui::Image::new(source).corner_radius(radius));
+            return;
+        }
+        fallback_avatar(ui, user, size);
+    }
+
+    /// Asks the worker for any profile picture the window is missing. The
+    /// results arrive as `Event::Avatar` and become textures.
+    fn request_avatars(&mut self) {
+        let mut wanted: Vec<String> = Vec::new();
+        if let Some(user) = &self.user {
+            wanted.push(user.avatar_url(64));
+        }
+        for account in &self.accounts {
+            wanted.push(account.user.avatar_url(64));
+        }
+        for url in wanted {
+            if self.avatars.contains_key(&url) || !self.avatar_requests.insert(url.clone()) {
+                continue;
+            }
+            self.worker.send(Command::FetchAvatar(url));
         }
     }
 
@@ -479,13 +559,12 @@ impl App {
         }
         self.accounts.push(SavedAccount {
             token: token.to_string(),
-            label: user.handle(),
-            id: user.id.clone(),
-            initial: user.initial(),
+            user: user.clone(),
         });
     }
 
-    /// Pulls tokens straight out of the local Discord profiles (Windows only).
+    /// Pulls tokens straight out of the local Discord profiles (Windows only)
+    /// and asks the worker to look up the account behind each one.
     fn detect_accounts(&mut self) {
         let found = crate::discord::token::detect();
         if found.is_empty() {
@@ -500,33 +579,24 @@ impl App {
             return;
         }
 
-        let mut added = 0;
-        for detected in found {
-            if self
-                .accounts
-                .iter()
-                .any(|account| account.token == detected.token)
-            {
-                continue;
-            }
-            self.accounts.push(SavedAccount {
-                token: detected.token.clone(),
-                initial: detected
-                    .label
-                    .chars()
-                    .next()
-                    .unwrap_or('?')
-                    .to_uppercase()
-                    .to_string(),
-                id: detected.token.chars().take(12).collect(),
-                label: detected.label,
-            });
-            added += 1;
+        let pending: Vec<(String, String)> = found
+            .into_iter()
+            .filter(|detected| {
+                !self
+                    .accounts
+                    .iter()
+                    .any(|account| account.token == detected.token)
+            })
+            .map(|detected| (detected.token, detected.label))
+            .collect();
+
+        if pending.is_empty() {
+            self.toast("Those accounts are already in the list.", ToastKind::Info);
+            return;
         }
-        self.toast(
-            format!("Found {added} account(s) on this device."),
-            ToastKind::Success,
-        );
+
+        self.toast("Checking the detected tokens…", ToastKind::Info);
+        self.worker.send(Command::ResolveAccounts(pending));
     }
 
     fn switch_account(&mut self, index: usize) {
@@ -704,21 +774,11 @@ impl App {
             );
             ui.add_space(7.0);
 
-            let accounts: Vec<(String, String, String)> = self
-                .accounts
-                .iter()
-                .map(|account| {
-                    (
-                        account.label.clone(),
-                        account.id.clone(),
-                        account.initial.clone(),
-                    )
-                })
-                .collect();
+            let accounts: Vec<SavedAccount> = self.accounts.clone();
             let mut connect = None;
             let mut remove = None;
 
-            for (index, (label, id, initial)) in accounts.iter().enumerate() {
+            for (index, account) in accounts.iter().enumerate() {
                 Frame::NONE
                     .fill(INPUT)
                     .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
@@ -726,19 +786,20 @@ impl App {
                     .inner_margin(Margin::symmetric(10, 5))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let (rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
-                            ui.painter()
-                                .circle_filled(rect.center(), 13.0, color_from_str(id));
-                            ui.painter().text(
-                                rect.center(),
-                                Align2::CENTER_CENTER,
-                                initial,
-                                theme::semibold(11.0),
-                                Color32::WHITE,
-                            );
-                            ui.add_space(2.0);
-                            ui.label(RichText::new(label).font(theme::semibold(12.0)).color(TEXT));
+                            self.avatar(ui, &account.user, 26.0);
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(account.user.display_name())
+                                        .font(theme::semibold(12.0))
+                                        .color(TEXT),
+                                );
+                                ui.label(
+                                    RichText::new(account.user.handle())
+                                        .font(theme::regular(10.0))
+                                        .color(MUTED),
+                                );
+                            });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if icon_button(ui, Icon::Close, 24.0, "Remove from this list")
                                     .clicked()
@@ -746,7 +807,14 @@ impl App {
                                     remove = Some(index);
                                 }
                                 ui.add_space(4.0);
-                                if pill_button(
+                                let connected = self
+                                    .user
+                                    .as_ref()
+                                    .map(|user| user.id == account.user.id)
+                                    .unwrap_or(false);
+                                if connected {
+                                    tag(ui, "Connected", SUCCESS, None);
+                                } else if pill_button(
                                     ui,
                                     "Connect",
                                     Some(Icon::Play),
@@ -1088,7 +1156,7 @@ impl App {
                             .inner_margin(Margin::symmetric(6, 4))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    avatar(ui, &user, 26.0);
+                                    self.avatar(ui, &user, 26.0);
                                     ui.add_space(1.0);
                                     ui.vertical(|ui| {
                                         ui.label(
@@ -1104,7 +1172,7 @@ impl App {
                                     });
                                     ui.add_space(4.0);
                                     if icon_button(ui, Icon::Logout, 26.0, "Sign out").clicked() {
-                                        self.logout();
+                                        self.confirm_logout = true;
                                     }
                                 });
                             });
@@ -1863,6 +1931,107 @@ impl App {
             });
     }
 
+    /// Signing out stops a running quest, so confirm first.
+    fn logout_window(&mut self, context: &egui::Context) {
+        if !self.confirm_logout {
+            return;
+        }
+        let Some(user) = self.user.clone() else {
+            self.confirm_logout = false;
+            return;
+        };
+
+        let mut open = true;
+        let mut sign_out = false;
+        let mut cancel = false;
+
+        egui::Window::new("Sign out")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                Frame::NONE
+                    .fill(SURFACE)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .corner_radius(CornerRadius::same(16))
+                    .shadow(theme::panel_shadow())
+                    .inner_margin(Margin::same(22)),
+            )
+            .show(context, |ui| {
+                ui.set_width(360.0);
+                ui.horizontal(|ui| {
+                    self.avatar(ui, &user, 42.0);
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(format!("Sign out of {}?", user.display_name()))
+                                .font(theme::semibold(14.5))
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new(user.handle())
+                                .font(theme::regular(11.0))
+                                .color(MUTED),
+                        );
+                    });
+                });
+
+                ui.add_space(12.0);
+                let note = if self.running.is_some() {
+                    "The running quest will be stopped. This account stays in the saved list and you can connect again with one click."
+                } else {
+                    "This account stays in the saved list, so you can connect again with one click."
+                };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(note).font(theme::regular(11.5)).color(TEXT_SOFT),
+                    )
+                    .wrap(),
+                );
+
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(
+                            ui,
+                            "Sign out",
+                            Some(Icon::Logout),
+                            tint(DANGER, 20),
+                            DANGER,
+                            Stroke::new(1.0_f32, tint(DANGER, 80)),
+                            0.0,
+                        )
+                        .clicked()
+                        {
+                            sign_out = true;
+                        }
+                        ui.add_space(6.0);
+                        if pill_button(
+                            ui,
+                            "Cancel",
+                            None,
+                            tint(TEXT, 8),
+                            TEXT_SOFT,
+                            Stroke::new(1.0_f32, BORDER_SOFT),
+                            0.0,
+                        )
+                        .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        if sign_out {
+            self.logout();
+            self.confirm_logout = false;
+        } else if cancel || !open {
+            self.confirm_logout = false;
+        }
+    }
+
     fn help_window(&mut self, context: &egui::Context) {
         if !self.show_help {
             return;
@@ -2087,6 +2256,7 @@ impl eframe::App for App {
         self.main_content(context);
         self.toast_ui(context);
         self.help_window(context);
+        self.logout_window(context);
     }
 }
 
@@ -2306,7 +2476,7 @@ fn mini_progress(ui: &mut Ui, ratio: f32, color: Color32, width: f32) {
     }
 }
 
-fn avatar(ui: &mut Ui, user: &User, size: f32) {
+fn fallback_avatar(ui: &mut Ui, user: &User, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     ui.painter()
         .circle_filled(rect.center(), size / 2.0, color_from_str(&user.id));

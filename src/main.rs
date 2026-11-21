@@ -39,6 +39,35 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Debug-only: show the account behind every token found on this device.
+    #[cfg(debug_assertions)]
+    if std::env::args().any(|arg| arg == "--detect-accounts") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        for found in discord::token::detect() {
+            let user = runtime.block_on(async {
+                discord::DiscordApi::new(&found.token)
+                    .ok()?
+                    .get_me()
+                    .await
+                    .ok()
+            });
+            match user {
+                Some(user) => println!(
+                    "{}: {} ({}) avatar={}",
+                    found.label,
+                    user.handle(),
+                    user.display_name(),
+                    user.avatar_url(64)
+                ),
+                None => println!("{}: token is no longer valid", found.label),
+            }
+        }
+        return Ok(());
+    }
+
     // Debug-only: exercise the DevTools sign-in from a terminal. This closes
     // and relaunches the Discord client.
     #[cfg(debug_assertions)]

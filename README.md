@@ -69,8 +69,10 @@ xattr -dr com.apple.quarantine /Applications/QuestPilot.app
   stored, decrypted through DPAPI — only when you ask for it. Nothing is read at startup.
 - **Sign in with the Discord app (Windows)**: one click restarts Discord with a loopback DevTools port and
   reads the token of the signed-in session, then logs in automatically. You are asked to confirm first.
-- **Saved accounts**: every successful sign-in is remembered in memory, so you can switch accounts with
-  one click from the sign-in screen (sign out keeps the list; closing the app clears it).
+- **Saved accounts**: every successful sign-in and every token found on this device is remembered in
+  memory with the account's real display name, @handle and profile picture, so you can switch with one
+  click from the sign-in screen. Signing out asks for confirmation (it stops a running quest) and keeps
+  the list; closing the app clears it.
 - **Do all**: queues open quests and runs them one by one; you can stop at any time.
 - Auto-claim rewards on completion (optional), refresh the list when you return to the window.
 - Filters by state (All / Open / Done) and by reward type (Nitro / Orbs / Decoration / Other), plus search,
@@ -111,8 +113,16 @@ Build debug and run with sample data (no token, no network):
 
 ```powershell
 $env:QUESTPILOT_DEMO = "1"          # enable sample data
-$env:QUESTPILOT_DEMO_VIEW = "logs"  # quests | empty | settings | logs | help
+$env:QUESTPILOT_DEMO_VIEW = "logs"  # quests | empty | settings | logs | help | login | logout
 cargo run
+```
+
+Debug builds also accept a few terminal-only flags for checking the platform glue:
+
+```powershell
+cargo run -- --detect-tokens    # labels + token prefixes found on this device
+cargo run -- --detect-accounts  # real name, @handle and avatar URL for each token
+cargo run -- --cdp-signin       # DevTools sign-in from the terminal
 ```
 
 ## Releasing
@@ -163,7 +173,7 @@ src/
   main.rs              creates the egui window
   app.rs               UI: login, quest list, settings, logs, toasts
   theme.rs             design tokens, Be Vietnam Pro font, vector icons, gradients
-  models.rs            parses Discord quest JSON into compact models
+  models.rs            parses Discord quest/user JSON into compact models
   config.rs            settings stored in the OS config dir (QuestPilot/settings.json)
   worker.rs            tokio worker: login, refresh, quest execution, queue, events
   discord/

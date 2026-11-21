@@ -25,6 +25,12 @@ pub enum LogLevel {
 pub enum Event {
     Log(LogLevel, String),
     AuthResult(std::result::Result<User, String>),
+    Accounts(Vec<DetectedAccount>),
+    Avatar {
+        url: String,
+        size: [usize; 2],
+        pixels: Vec<u8>,
+    },
     Quests {
         quests: Vec<Quest>,
         note: Option<String>,
@@ -51,11 +57,21 @@ pub enum Command {
     Login(String),
     Logout,
     Refresh,
+    /// `(token, source label)` pairs found on disk; resolved to real users.
+    ResolveAccounts(Vec<(String, String)>),
+    FetchAvatar(String),
     Start(Quest, Settings),
     StartQueue(Vec<Quest>, Settings),
     Stop,
     Claim(String),
     UpdateSettings(Settings),
+}
+
+/// A detected token paired with the account it belongs to.
+#[derive(Clone, Debug)]
+pub struct DetectedAccount {
+    pub token: String,
+    pub user: User,
 }
 
 pub struct Handle {
@@ -252,6 +268,15 @@ impl Worker {
                 self.emitter.log(LogLevel::Info, "Signed out.");
             }
             Command::Refresh => self.refresh_quests().await,
+            Command::ResolveAccounts(found) => self.resolve_accounts(found).await,
+            Command::FetchAvatar(url) => {
+                let emitter = self.emitter.clone();
+                tokio::spawn(async move {
+                    if let Some((size, pixels)) = download_avatar(&url).await {
+                        emitter.send(Event::Avatar { url, size, pixels });
+                    }
+                });
+            }
             Command::Start(quest, settings) => {
                 self.settings = settings;
                 self.queue.clear();
@@ -285,6 +310,54 @@ impl Worker {
             Command::Claim(quest_id) => self.claim(quest_id).await,
             Command::UpdateSettings(settings) => self.settings = settings,
         }
+    }
+
+    /// Turns raw tokens found on disk into real accounts, so the window can
+    /// show the right name and avatar instead of the Discord build they came
+    /// from.
+    async fn resolve_accounts(&mut self, found: Vec<(String, String)>) {
+        let total = found.len();
+        let mut resolved = Vec::new();
+        for (token, source) in found {
+            let api = match DiscordApi::new(&token) {
+                Ok(api) => api,
+                Err(error) => {
+                    self.emitter.log(
+                        LogLevel::Warn,
+                        format!(
+                            "Could not read the {source} token: {}",
+                            friendly_error(&error)
+                        ),
+                    );
+                    continue;
+                }
+            };
+            match api.get_me().await {
+                Ok(user) => {
+                    self.emitter.log(
+                        LogLevel::Info,
+                        format!("Found {} ({source}).", user.handle()),
+                    );
+                    resolved.push(DetectedAccount { token, user });
+                }
+                Err(error) => {
+                    self.emitter.log(
+                        LogLevel::Warn,
+                        format!(
+                            "The {source} token is no longer valid: {}",
+                            friendly_error(&error)
+                        ),
+                    );
+                }
+            }
+        }
+        if resolved.is_empty() {
+            self.emitter.log(
+                LogLevel::Warn,
+                format!("None of the {total} detected token(s) could be used."),
+            );
+        }
+        self.emitter.send(Event::Accounts(resolved));
     }
 
     async fn login(&mut self, token: String) {
@@ -1090,6 +1163,72 @@ fn friendly_error(error: &anyhow::Error) -> String {
     }
 }
 
+/// Small shared client for the avatar CDN. Tokens are not needed there.
+fn avatar_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(8))
+                .timeout(Duration::from_secs(12))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn download_avatar(url: &str) -> Option<([usize; 2], Vec<u8>)> {
+    let client = avatar_client()?;
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    if response
+        .content_length()
+        .map(|length| length > 2 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    decode_png(&bytes)
+}
+
+/// Discord serves avatar PNGs; decode them into the RGBA buffer egui wants.
+fn decode_png(bytes: &[u8]) -> Option<([usize; 2], Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // Paletted and low-bit-depth avatars are expanded to 8-bit RGB(A).
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    buffer.truncate(info.buffer_size());
+
+    let pixels = match info.color_type {
+        png::ColorType::Rgba => buffer,
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity(buffer.len() / 3 * 4);
+            for chunk in buffer.as_chunks::<3>().0 {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            rgba
+        }
+        png::ColorType::Grayscale => buffer
+            .iter()
+            .flat_map(|value| [*value, *value, *value, 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buffer
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|chunk| [chunk[0], chunk[0], chunk[0], chunk[1]])
+            .collect(),
+        png::ColorType::Indexed => return None,
+    };
+
+    Some(([info.width as usize, info.height as usize], pixels))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,5 +1303,27 @@ mod tests {
         assert_eq!(percent(1200.0, 900.0), 100.0);
         assert_eq!(percent(-5.0, 900.0), 0.0);
         assert_eq!(percent(10.0, 0.0), 0.0);
+    }
+
+    /// A 2x2 palette PNG with a `tRNS` chunk. Discord still serves these for
+    /// some legacy avatars, so they must decode through the normalization path.
+    const PALETTE_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAMAAABFaP0WAAAADFBMVEX/AAAA/wAAAP/////7AGD2AAAABHRSTlP/gAD/oaGUZgAAAA5JREFUeJxjYGBkYGIGAAARAAeeoioSAAAAAElFTkSuQmCC";
+
+    #[test]
+    fn palette_avatars_decode_to_rgba() {
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, PALETTE_PNG)
+            .expect("valid base64");
+        let (size, pixels) = decode_png(&bytes).expect("decode palette png");
+        assert_eq!(size, [2, 2]);
+        assert_eq!(pixels.len(), 16);
+        assert_eq!(
+            pixels.as_slice(),
+            [
+                255, 0, 0, 255, // red, opaque
+                0, 255, 0, 128, // green, half transparent
+                0, 0, 255, 0, // blue, fully transparent
+                255, 255, 255, 255, // white, opaque
+            ]
+        );
     }
 }
