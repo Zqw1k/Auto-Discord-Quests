@@ -1125,7 +1125,7 @@ impl App {
                             .color(TEXT),
                     );
                     ui.label(
-                        RichText::new("v0.1")
+                        RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
                             .font(theme::regular(10.0))
                             .color(MUTED),
                     );
