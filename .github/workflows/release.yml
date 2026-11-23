@@ -115,6 +115,7 @@ jobs:
           cp assets/icon.png AppDir/questpilot.png
           cp assets/icon.png AppDir/.DirIcon
           cp assets/icon.png AppDir/usr/share/icons/hicolor/512x512/apps/questpilot.png
+          cp NOTICE AppDir/NOTICE
           cat > AppDir/AppRun <<'EOF'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
