@@ -126,4 +126,6 @@ scripts/shot.ps1       window screenshots
 
 ## License
 
-MIT.
+MIT. Portions of `src/discord/fingerprint.rs` are derived from
+[Masterain98/discord-quest-helper](https://github.com/Masterain98/discord-quest-helper)
+(MIT, Copyright (c) 2025 Masterain) — see [NOTICE](NOTICE).
